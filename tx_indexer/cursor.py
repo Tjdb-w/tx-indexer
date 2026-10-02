@@ -16,15 +16,22 @@ from .errors import InvalidCursorError
 _CURSOR_VERSION = 1
 
 
+def _filter_snapshot(filters):
+    """游标绑定的完整筛选条件快照。"""
+    return {
+        "address": filters.get("address"),
+        "methods": filters.get("methods"),
+        "from_addresses": filters.get("from_addresses"),
+        "to_addresses": filters.get("to_addresses"),
+        "start_time": filters.get("start_time"),
+        "end_time": filters.get("end_time"),
+    }
+
+
 def encode_cursor(filters, after_block, after_tx_hash):
     payload = {
         "v": _CURSOR_VERSION,
-        "f": {
-            "address": filters.get("address"),
-            "method": filters.get("method"),
-            "start_time": filters.get("start_time"),
-            "end_time": filters.get("end_time"),
-        },
+        "f": _filter_snapshot(filters),
         "after": [after_block, after_tx_hash],
     }
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -57,12 +64,7 @@ def decode_cursor(token, filters):
     if not isinstance(saved, dict):
         raise InvalidCursorError("游标缺少筛选信息", None)
 
-    current = {
-        "address": filters.get("address"),
-        "method": filters.get("method"),
-        "start_time": filters.get("start_time"),
-        "end_time": filters.get("end_time"),
-    }
+    current = _filter_snapshot(filters)
     if any(saved.get(key) != current[key] for key in current):
         raise InvalidCursorError("游标与当前筛选条件不匹配", None)
 

@@ -33,9 +33,15 @@
 
 筛选选项（两类命令通用，条件之间取交集；时间窗左闭右闭）：
 
-- `--address ADDR`：精确匹配发送方或接收方
-- `--method METHOD`：精确匹配方法
+- `--address ADDR`：精确匹配发送方或接收方（不能与 `--from-address` / `--to-address` 并用）
+- `--from-address ADDR`：精确匹配付款方，可重复出现（集合内任一命中）
+- `--to-address ADDR`：精确匹配收款方，可重复出现（集合内任一命中）
+- `--method METHOD`：精确匹配方法，可重复出现（集合内任一命中）
 - `--start-time TS` / `--end-time TS`：非负 UTC 秒整数，含端点
+
+集合类筛选（`--from-address` / `--to-address` / `--method`）重复值等同一个条件；
+任一筛选值为空或仅含空白，或 `--address` 与付款方、收款方筛选并用，都会在读取
+数据文件前报 `invalid_filter`。
 
 `query` 额外选项：
 
@@ -81,6 +87,7 @@
 | --- | --- |
 | `invalid_transaction` | 记录解析或字段校验失败（含行号） |
 | `duplicate_transaction` | `tx_hash` 冲突（含冲突所在行号） |
+| `invalid_filter` | 筛选值为空或仅含空白，或 `--address` 与付款方/收款方筛选冲突 |
 | `invalid_time_range` | 时间窗倒置（`start_time > end_time`） |
 | `invalid_page_size` | `page_size` 越界或无法解析 |
 | `invalid_cursor` | 游标非法（格式/解码错误）或与当前筛选不匹配 |
@@ -90,10 +97,10 @@
 - `tx_indexer/loader.py`：JSON Lines 解析与校验
 - `tx_indexer/engine.py`：筛选、排序、keyset 游标分页、聚合
 - `tx_indexer/cursor.py`：不透明游标编解码（base64url）
-- `tx_indexer/errors.py`：五类异常
+- `tx_indexer/errors.py`：六类异常
 - `tx_indexer/cli.py`：命令行入口
 - `tests/`：unittest 测试（`python3 -m unittest discover -s tests`）
 
 ## 状态
 
-已实现：公开查询、游标分页、聚合统计与五类异常。
+已实现：公开查询、组合筛选（付款方/收款方/方法集合）、游标分页、聚合统计与六类异常。

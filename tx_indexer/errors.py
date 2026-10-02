@@ -37,6 +37,12 @@ class DuplicateTransactionError(TxIndexerError):
     error = "duplicate_transaction"
 
 
+class InvalidFilterError(TxIndexerError):
+    """筛选条件非法（值为空或仅含空白，或 address 与付款方/收款方筛选冲突）。"""
+
+    error = "invalid_filter"
+
+
 class InvalidTimeRangeError(TxIndexerError):
     """时间窗倒置（start_time > end_time）。"""
 

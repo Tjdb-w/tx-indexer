@@ -5,6 +5,7 @@ import unittest
 from tx_indexer.engine import TxIndexer, normalize_filters
 from tx_indexer.errors import (
     InvalidCursorError,
+    InvalidFilterError,
     InvalidPageSizeError,
     InvalidTimeRangeError,
 )
@@ -137,6 +138,121 @@ class QueryTest(unittest.TestCase):
              "to_address", "method", "amount"],
         )
         self.assertIsInstance(tx["amount"], str)
+
+
+class CombinedFilterTest(unittest.TestCase):
+    """--from-address / --to-address / 可重复 --method 的组合筛选。"""
+
+    def setUp(self):
+        self.records = [
+            rec("h1", 1, 10, "alice", "bob", "transfer", "10"),
+            rec("h2", 2, 20, "bob", "alice", "approve", "20"),
+            rec("h3", 3, 30, "alice", "carol", "transfer", "30"),
+            rec("h4", 4, 40, "carol", "alice", "mint", "40"),
+        ]
+        self.idx = TxIndexer(self.records)
+
+    def test_from_addresses_set_any_hit(self):
+        result = self.idx.query(
+            normalize_filters(from_addresses=["alice", "carol"])
+        )
+        self.assertEqual(hashes(result), ["h1", "h3", "h4"])
+
+    def test_to_addresses_set_any_hit(self):
+        result = self.idx.query(
+            normalize_filters(to_addresses=["alice", "carol"])
+        )
+        self.assertEqual(hashes(result), ["h2", "h3", "h4"])
+
+    def test_methods_set_any_hit(self):
+        result = self.idx.query(
+            normalize_filters(method=["transfer", "mint"])
+        )
+        self.assertEqual(hashes(result), ["h1", "h3", "h4"])
+
+    def test_single_method_string_still_works(self):
+        result = self.idx.query(normalize_filters(method="approve"))
+        self.assertEqual(hashes(result), ["h2"])
+
+    def test_sets_intersect_across_dimensions(self):
+        result = self.idx.query(normalize_filters(
+            from_addresses=["alice", "carol"],
+            to_addresses=["alice", "carol"],
+            method=["transfer", "mint"],
+        ))
+        self.assertEqual(hashes(result), ["h3", "h4"])
+
+    def test_sets_intersect_with_time_window(self):
+        result = self.idx.query(normalize_filters(
+            from_addresses=["alice"], start_time=10, end_time=30,
+        ))
+        self.assertEqual(hashes(result), ["h1", "h3"])
+
+    def test_duplicate_values_count_as_one(self):
+        filters = normalize_filters(
+            method=["transfer", "transfer", "mint", "transfer"],
+            from_addresses=["alice", "alice"],
+        )
+        self.assertEqual(filters["methods"], ["mint", "transfer"])
+        self.assertEqual(filters["from_addresses"], ["alice"])
+        self.assertEqual(hashes(self.idx.query(filters)), ["h1", "h3"])
+
+    def test_empty_and_whitespace_values_rejected(self):
+        for kwargs in (
+            {"method": [""]},
+            {"method": ["transfer", "   "]},
+            {"from_addresses": ["\t"]},
+            {"to_addresses": [""]},
+            {"address": "  "},
+        ):
+            with self.assertRaises(InvalidFilterError, msg=repr(kwargs)):
+                normalize_filters(**kwargs)
+
+    def test_address_conflicts_with_from_or_to(self):
+        with self.assertRaises(InvalidFilterError):
+            normalize_filters(address="alice", from_addresses=["bob"])
+        with self.assertRaises(InvalidFilterError):
+            normalize_filters(address="alice", to_addresses=["bob"])
+        # 仅 method 集合与 address 不冲突
+        filters = normalize_filters(address="alice", method=["transfer"])
+        self.assertEqual(
+            hashes(self.idx.query(filters)), ["h1", "h3"])
+
+    def test_cursor_binds_new_filter_sets(self):
+        filters = normalize_filters(
+            from_addresses=["alice"], method=["transfer", "mint"])
+        page1 = self.idx.query(filters, page_size=1)
+        self.assertEqual(hashes(page1), ["h1"])
+        page2 = self.idx.query(filters, page_size=1,
+                               cursor=page1["next_cursor"])
+        self.assertEqual(hashes(page2), ["h3"])
+        self.assertIsNone(page2["next_cursor"])
+        # 同一游标换一组筛选 → invalid_cursor
+        other = normalize_filters(from_addresses=["carol"])
+        with self.assertRaises(InvalidCursorError):
+            self.idx.query(other, page_size=1, cursor=page1["next_cursor"])
+
+    def test_stats_with_combined_filters(self):
+        stats = self.idx.stats(normalize_filters(
+            from_addresses=["alice", "carol"], method=["transfer", "mint"],
+        ))
+        self.assertEqual(stats["total_count"], 3)
+        self.assertEqual(stats["total_amount"], "80")
+        self.assertEqual(stats["min_amount"], "10")
+        self.assertEqual(stats["max_amount"], "40")
+        self.assertEqual(stats["avg_amount"], "26")  # 80 // 3
+
+    def test_stats_no_match_with_combined_filters(self):
+        stats = self.idx.stats(normalize_filters(
+            from_addresses=["alice"], to_addresses=["dave"],
+        ))
+        self.assertEqual(stats, {
+            "total_count": 0,
+            "total_amount": "0",
+            "min_amount": None,
+            "max_amount": None,
+            "avg_amount": None,
+        })
 
 
 class StatsTest(unittest.TestCase):

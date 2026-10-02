@@ -143,6 +143,104 @@ class CliTest(unittest.TestCase):
         self.assertEqual([t["tx_hash"] for t in page["transactions"]],
                          ["h2", "h3"])
 
+    def test_query_from_to_and_repeated_method(self):
+        code, page, _ = self._run([
+            "query", self.path,
+            "--from-address", "alice", "--from-address", "bob",
+            "--method", "transfer", "--method", "approve",
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page["transactions"]],
+                         ["h1", "h2", "h3"])
+        self.assertEqual(page["total"], 3)
+
+    def test_query_from_and_to_intersect(self):
+        code, page, _ = self._run([
+            "query", self.path,
+            "--from-address", "alice", "--to-address", "carol",
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page["transactions"]], ["h3"])
+
+    def test_stats_with_combined_filters(self):
+        code, stats, _ = self._run([
+            "stats", self.path,
+            "--from-address", "alice",
+            "--method", "transfer", "--method", "approve",
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(stats["total_count"], 2)
+        self.assertEqual(stats["total_amount"], "15")
+        self.assertEqual(stats["avg_amount"], "7")
+
+    def test_repeated_method_dedupes(self):
+        code, page, _ = self._run([
+            "query", self.path,
+            "--method", "transfer", "--method", "transfer",
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(page["total"], 2)
+
+    def test_pagination_with_combined_filters(self):
+        argv = ["query", self.path, "--page-size", "1",
+                "--method", "transfer", "--method", "approve"]
+        code, page1, _ = self._run(argv)
+        self.assertEqual(code, 0)
+        code, page2, _ = self._run(argv + ["--cursor", page1["next_cursor"]])
+        self.assertEqual(code, 0)
+        code, page3, _ = self._run(argv + ["--cursor", page2["next_cursor"]])
+        self.assertEqual(code, 0)
+        collected = ([t["tx_hash"] for t in page1["transactions"]]
+                     + [t["tx_hash"] for t in page2["transactions"]]
+                     + [t["tx_hash"] for t in page3["transactions"]])
+        self.assertEqual(collected, ["h1", "h2", "h3"])
+        self.assertIsNone(page3["next_cursor"])
+
+    def test_cursor_issued_for_other_filter_set_rejected(self):
+        code, page1, _ = self._run(
+            ["query", self.path, "--page-size", "1", "--method", "transfer"])
+        self.assertEqual(code, 0)
+        code, _, err = self._run([
+            "query", self.path, "--page-size", "1",
+            "--method", "transfer", "--method", "approve",
+            "--cursor", page1["next_cursor"],
+        ])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(err)["error"], "invalid_cursor")
+
+    def test_address_conflicts_with_from_address(self):
+        code, out, err = self._run([
+            "query", self.path,
+            "--address", "alice", "--from-address", "bob",
+        ])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_filter")
+        self.assertIsNone(payload["input_line"])
+
+    def test_address_conflicts_with_to_address_on_stats(self):
+        code, _, err = self._run([
+            "stats", self.path, "--address", "alice", "--to-address", "bob",
+        ])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(err)["error"], "invalid_filter")
+
+    def test_blank_filter_value_rejected_before_reading_file(self):
+        # 文件不存在也先报 invalid_filter，说明校验先于读取数据文件
+        missing = os.path.join(self.tmp.name, "no-such-file.jsonl")
+        for argv in (
+            ["query", missing, "--method", "   "],
+            ["stats", missing, "--from-address", ""],
+            ["stats", missing, "--address", "alice", "--to-address", "bob"],
+        ):
+            code, out, err = self._run(argv)
+            self.assertEqual(code, 2, msg=repr(argv))
+            self.assertIsNone(out)
+            payload = json.loads(err)
+            self.assertEqual(payload["error"], "invalid_filter", msg=repr(argv))
+            self.assertIsNone(payload["input_line"])
+
 
 if __name__ == "__main__":
     unittest.main()
