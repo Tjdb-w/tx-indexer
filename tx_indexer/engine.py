@@ -1,8 +1,10 @@
 """查询、游标分页与聚合统计引擎。
 
-筛选条件（全部取交集，均可省略）：
-- ``address``：精确匹配 from_address 或 to_address
-- ``method``：精确匹配 method
+筛选条件（不同条件之间取交集，均可省略）：
+- ``address``：精确匹配 from_address 或 to_address（不可与
+  ``from_address`` / ``to_address`` 并用）
+- ``from_address`` / ``to_address`` / ``method``：值集合，集合内部
+  任一命中即可；可重复给定，重复值等同一个条件
 - ``start_time`` / ``end_time``：时间窗，左闭右闭（UTC 秒）
 
 排序：block_number 升序，同高度按 tx_hash 升序。
@@ -13,7 +15,11 @@
 import bisect
 
 from .cursor import decode_cursor, encode_cursor
-from .errors import InvalidPageSizeError, InvalidTimeRangeError
+from .errors import (
+    InvalidFilterError,
+    InvalidPageSizeError,
+    InvalidTimeRangeError,
+)
 
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 1000
@@ -29,13 +35,44 @@ _PUBLIC_FIELDS = (
 )
 
 
-def normalize_filters(address=None, method=None, start_time=None, end_time=None):
-    """校验并归一化筛选条件。"""
-    if address is not None and (not isinstance(address, str) or address == ""):
-        # 命令行层通常不会走到这里；防御性处理
-        raise ValueError("address 必须为非空字符串")
-    if method is not None and (not isinstance(method, str) or method == ""):
-        raise ValueError("method 必须为非空字符串")
+def _normalize_value_set(name, values):
+    """把单个值或值迭代器归一化为去重后的 frozenset；空集合返回 None。"""
+    if values is None:
+        return None
+    if isinstance(values, str):
+        values = (values,)
+    result = set()
+    for value in values:
+        if not isinstance(value, str) or value.strip() == "":
+            raise InvalidFilterError(
+                "%s 筛选值不能为空或仅含空白" % name, None
+            )
+        result.add(value)
+    if not result:
+        return None
+    return frozenset(result)
+
+
+def normalize_filters(address=None, method=None, start_time=None, end_time=None,
+                      from_address=None, to_address=None):
+    """校验并归一化筛选条件。
+
+    ``method`` / ``from_address`` / ``to_address`` 接受单个字符串或
+    字符串迭代器，归一化为去重集合（frozenset）；不给或为空则为 None。
+    """
+    if address is not None and (
+        not isinstance(address, str) or address.strip() == ""
+    ):
+        raise InvalidFilterError(
+            "address 筛选值不能为空或仅含空白", None
+        )
+    from_set = _normalize_value_set("from_address", from_address)
+    to_set = _normalize_value_set("to_address", to_address)
+    method_set = _normalize_value_set("method", method)
+    if address is not None and (from_set is not None or to_set is not None):
+        raise InvalidFilterError(
+            "address 不能与 from_address / to_address 同时使用", None
+        )
     for name, value in (("start_time", start_time), ("end_time", end_time)):
         if value is not None and (
             not isinstance(value, int) or isinstance(value, bool) or value < 0
@@ -49,7 +86,9 @@ def normalize_filters(address=None, method=None, start_time=None, end_time=None)
         )
     return {
         "address": address,
-        "method": method,
+        "from_address": from_set,
+        "to_address": to_set,
+        "method": method_set,
         "start_time": start_time,
         "end_time": end_time,
     }
@@ -60,7 +99,20 @@ def _matches(record, filters):
         addr = filters["address"]
         if record["from_address"] != addr and record["to_address"] != addr:
             return False
-    if filters["method"] is not None and record["method"] != filters["method"]:
+    if (
+        filters["from_address"] is not None
+        and record["from_address"] not in filters["from_address"]
+    ):
+        return False
+    if (
+        filters["to_address"] is not None
+        and record["to_address"] not in filters["to_address"]
+    ):
+        return False
+    if (
+        filters["method"] is not None
+        and record["method"] not in filters["method"]
+    ):
         return False
     ts = record["timestamp"]
     if filters["start_time"] is not None and ts < filters["start_time"]:

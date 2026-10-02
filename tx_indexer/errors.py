@@ -43,6 +43,12 @@ class InvalidTimeRangeError(TxIndexerError):
     error = "invalid_time_range"
 
 
+class InvalidFilterError(TxIndexerError):
+    """筛选条件非法（值为空白）或组合冲突（address 与 from/to 并用）。"""
+
+    error = "invalid_filter"
+
+
 class InvalidPageSizeError(TxIndexerError):
     """page_size 越界（不在 1..1000）或无法解析。"""
 

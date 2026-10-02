@@ -1,10 +1,14 @@
 """不透明分页游标。
 
-游标为自包含令牌：base64url 编码的 JSON，记录签发时的筛选条件与
+游标为自包含令牌：base64url 编码的 JSON，记录签发时的完整筛选条件与
 本页最后一条记录的排序键 ``(block_number, tx_hash)``（exclusive marker）。
 
 - 格式错误、无法解码或字段非法 → InvalidCursorError
 - 游标内筛选与当前请求筛选不一致 → InvalidCursorError
+
+筛选快照中集合类条件（from_address / to_address / method）统一存为
+排序后的列表；解码比较时同样归一化，因此旧版游标（method 为单个字符串、
+无集合字段）在筛选等价时仍可续页。
 """
 
 import base64
@@ -16,15 +20,31 @@ from .errors import InvalidCursorError
 _CURSOR_VERSION = 1
 
 
+def _as_sorted_list(value):
+    """集合类筛选的规范形：None → None，单字符串 → [值]，其余 → 排序列表。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value]
+    return sorted(value)
+
+
+def _canonical_filters(filters):
+    """提取用于游标绑定比对的筛选快照（集合归一化为排序列表）。"""
+    return {
+        "address": filters.get("address"),
+        "from_address": _as_sorted_list(filters.get("from_address")),
+        "to_address": _as_sorted_list(filters.get("to_address")),
+        "method": _as_sorted_list(filters.get("method")),
+        "start_time": filters.get("start_time"),
+        "end_time": filters.get("end_time"),
+    }
+
+
 def encode_cursor(filters, after_block, after_tx_hash):
     payload = {
         "v": _CURSOR_VERSION,
-        "f": {
-            "address": filters.get("address"),
-            "method": filters.get("method"),
-            "start_time": filters.get("start_time"),
-            "end_time": filters.get("end_time"),
-        },
+        "f": _canonical_filters(filters),
         "after": [after_block, after_tx_hash],
     }
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -57,13 +77,12 @@ def decode_cursor(token, filters):
     if not isinstance(saved, dict):
         raise InvalidCursorError("游标缺少筛选信息", None)
 
-    current = {
-        "address": filters.get("address"),
-        "method": filters.get("method"),
-        "start_time": filters.get("start_time"),
-        "end_time": filters.get("end_time"),
-    }
-    if any(saved.get(key) != current[key] for key in current):
+    try:
+        saved_canonical = _canonical_filters(saved)
+        current_canonical = _canonical_filters(filters)
+    except (TypeError, ValueError) as exc:
+        raise InvalidCursorError("游标筛选信息非法", None) from exc
+    if saved_canonical != current_canonical:
         raise InvalidCursorError("游标与当前筛选条件不匹配", None)
 
     after = payload.get("after")

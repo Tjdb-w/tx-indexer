@@ -5,7 +5,8 @@
     tx-indexer stats <data.jsonl> [筛选选项]
 
 领域错误（invalid_transaction / duplicate_transaction / invalid_time_range /
-invalid_page_size / invalid_cursor）以 JSON 对象输出到 stderr，退出码 2：
+invalid_page_size / invalid_cursor / invalid_filter）以 JSON 对象输出到
+stderr，退出码 2：
 
     {"error": "...", "message": "...", "input_line": 12}
 """
@@ -20,8 +21,25 @@ from .loader import load_file
 
 
 def _add_filter_args(parser):
-    parser.add_argument("--address", help="精确匹配发送方或接收方地址")
-    parser.add_argument("--method", help="精确匹配 method")
+    parser.add_argument(
+        "--address",
+        help="精确匹配发送方或接收方地址（不可与 --from-address/--to-address 并用）",
+    )
+    parser.add_argument(
+        "--from-address",
+        action="append",
+        help="精确匹配发送方地址，可重复（集合内任一命中）",
+    )
+    parser.add_argument(
+        "--to-address",
+        action="append",
+        help="精确匹配接收方地址，可重复（集合内任一命中）",
+    )
+    parser.add_argument(
+        "--method",
+        action="append",
+        help="精确匹配 method，可重复（集合内任一命中）",
+    )
     parser.add_argument("--start-time", help="时间窗起点（UTC 秒，含）")
     parser.add_argument("--end-time", help="时间窗终点（UTC 秒，含）")
 
@@ -86,12 +104,16 @@ def _filters_from_args(args, parser):
         if args.end_time is not None
         else None
     )
-    # 倒置校验集中在 normalize_filters，抛 InvalidTimeRangeError
+    # 倒置校验集中在 normalize_filters，抛 InvalidTimeRangeError；
+    # 空白值与 address/from/to 冲突也在此抛 InvalidFilterError，
+    # 均发生在读取数据文件之前
     return normalize_filters(
         address=args.address,
         method=args.method,
         start_time=start_time,
         end_time=end_time,
+        from_address=args.from_address,
+        to_address=args.to_address,
     )
 
 

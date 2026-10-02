@@ -143,6 +143,85 @@ class CliTest(unittest.TestCase):
         self.assertEqual([t["tx_hash"] for t in page["transactions"]],
                          ["h2", "h3"])
 
+    def test_query_from_to_address_and_repeated_method(self):
+        code, page, _ = self._run([
+            "query", self.path,
+            "--from-address", "alice", "--from-address", "bob",
+            "--to-address", "alice", "--to-address", "carol",
+            "--method", "transfer", "--method", "approve",
+            "--method", "transfer",
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page["transactions"]],
+                         ["h2", "h3"])
+        self.assertEqual(page["total"], 2)
+
+    def test_stats_with_set_filters(self):
+        code, stats, _ = self._run([
+            "stats", self.path,
+            "--from-address", "alice",
+            "--method", "transfer", "--method", "approve",
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(stats, {
+            "total_count": 2,
+            "total_amount": "15",
+            "min_amount": "5",
+            "max_amount": "10",
+            "avg_amount": "7",
+        })
+
+    def test_address_conflict_exit_2_before_file_read(self):
+        # 数据文件不存在：若先读文件则不是 invalid_filter
+        missing = os.path.join(self.tmp.name, "missing.jsonl")
+        for extra in (["--from-address", "bob"], ["--to-address", "bob"]):
+            code, out, err = self._run(
+                ["query", missing, "--address", "alice"] + extra)
+            self.assertEqual(code, 2)
+            self.assertIsNone(out)
+            payload = json.loads(err)
+            self.assertEqual(payload["error"], "invalid_filter")
+            self.assertIsNone(payload["input_line"])
+
+    def test_blank_filter_value_exit_2_before_file_read(self):
+        missing = os.path.join(self.tmp.name, "missing.jsonl")
+        for extra in (["--address", "  "], ["--from-address", ""],
+                      ["--to-address", " \t"], ["--method", ""]):
+            code, out, err = self._run(["stats", missing] + extra)
+            self.assertEqual(code, 2)
+            self.assertIsNone(out)
+            payload = json.loads(err)
+            self.assertEqual(payload["error"], "invalid_filter")
+            self.assertIsNone(payload["input_line"])
+
+    def test_cursor_bound_to_new_filters(self):
+        code, page1, _ = self._run([
+            "query", self.path,
+            "--from-address", "alice", "--page-size", "1"])
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(page1["next_cursor"])
+
+        # 相同筛选续页正常
+        code, page2, _ = self._run([
+            "query", self.path,
+            "--from-address", "alice", "--page-size", "1",
+            "--cursor", page1["next_cursor"]])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page2["transactions"]],
+                         ["h3"])
+        self.assertIsNone(page2["next_cursor"])
+
+        # 改变新增筛选组合复用旧游标 → invalid_cursor
+        code, out, err = self._run([
+            "query", self.path,
+            "--from-address", "bob", "--page-size", "1",
+            "--cursor", page1["next_cursor"]])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_cursor")
+        self.assertIsNone(payload["input_line"])
+
 
 if __name__ == "__main__":
     unittest.main()

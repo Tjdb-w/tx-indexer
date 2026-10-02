@@ -5,6 +5,7 @@ import unittest
 from tx_indexer.engine import TxIndexer, normalize_filters
 from tx_indexer.errors import (
     InvalidCursorError,
+    InvalidFilterError,
     InvalidPageSizeError,
     InvalidTimeRangeError,
 )
@@ -137,6 +138,142 @@ class QueryTest(unittest.TestCase):
              "to_address", "method", "amount"],
         )
         self.assertIsInstance(tx["amount"], str)
+
+
+class SetFilterTest(unittest.TestCase):
+    """from_address / to_address / method 集合筛选。"""
+
+    def setUp(self):
+        self.records = [
+            rec("h1", 1, 10, "alice", "bob", "transfer", "10"),
+            rec("h2", 2, 20, "bob", "alice", "approve", "20"),
+            rec("h3", 3, 30, "alice", "carol", "transfer", "30"),
+            rec("h4", 4, 40, "carol", "dave", "mint", "40"),
+        ]
+        self.idx = TxIndexer(self.records)
+
+    def test_from_address_set_any_match(self):
+        result = self.idx.query(
+            normalize_filters(from_address=["alice", "carol"])
+        )
+        self.assertEqual(hashes(result), ["h1", "h3", "h4"])
+
+    def test_to_address_set_any_match(self):
+        result = self.idx.query(
+            normalize_filters(to_address=["alice", "dave"])
+        )
+        self.assertEqual(hashes(result), ["h2", "h4"])
+
+    def test_method_set_any_match(self):
+        result = self.idx.query(
+            normalize_filters(method=["approve", "mint"])
+        )
+        self.assertEqual(hashes(result), ["h2", "h4"])
+
+    def test_single_string_still_accepted(self):
+        result = self.idx.query(normalize_filters(from_address="alice"))
+        self.assertEqual(hashes(result), ["h1", "h3"])
+
+    def test_sets_intersect_across_dimensions(self):
+        result = self.idx.query(
+            normalize_filters(
+                from_address=["alice", "carol"],
+                to_address=["carol", "dave"],
+                method=["transfer", "mint"],
+            )
+        )
+        self.assertEqual(hashes(result), ["h3", "h4"])
+
+    def test_duplicate_values_collapse(self):
+        result = self.idx.query(
+            normalize_filters(method=["transfer", "transfer", "approve"])
+        )
+        self.assertEqual(hashes(result), ["h1", "h2", "h3"])
+
+    def test_empty_iterable_means_no_filter(self):
+        result = self.idx.query(normalize_filters(method=[]))
+        self.assertEqual(result["total"], 4)
+
+    def test_blank_values_rejected(self):
+        for kwargs in (
+            {"address": ""},
+            {"address": "   "},
+            {"from_address": ["alice", ""]},
+            {"to_address": ["  "]},
+            {"method": ["\t"]},
+        ):
+            with self.assertRaises(InvalidFilterError):
+                normalize_filters(**kwargs)
+
+    def test_address_conflicts_with_from_or_to(self):
+        with self.assertRaises(InvalidFilterError):
+            normalize_filters(address="alice", from_address=["bob"])
+        with self.assertRaises(InvalidFilterError):
+            normalize_filters(address="alice", to_address=["bob"])
+        # 仅 address 或仅 from/to 不冲突
+        normalize_filters(address="alice")
+        normalize_filters(from_address=["alice"], to_address=["bob"])
+
+    def test_cursor_binds_new_filters(self):
+        page1 = self.idx.query(
+            normalize_filters(from_address=["alice"]), page_size=1
+        )
+        cursor = page1["next_cursor"]
+        self.assertIsNotNone(cursor)
+        # 相同筛选可续页
+        page2 = self.idx.query(
+            normalize_filters(from_address=["alice"]),
+            page_size=1,
+            cursor=cursor,
+        )
+        self.assertEqual(hashes(page2), ["h3"])
+        # 换集合成员 → invalid_cursor
+        with self.assertRaises(InvalidCursorError):
+            self.idx.query(
+                normalize_filters(from_address=["bob"]),
+                page_size=1,
+                cursor=cursor,
+            )
+        # 集合基数不同同样不匹配
+        with self.assertRaises(InvalidCursorError):
+            self.idx.query(
+                normalize_filters(from_address=["alice", "carol"]),
+                page_size=1,
+                cursor=cursor,
+            )
+
+    def test_cursor_order_insensitive_for_sets(self):
+        page1 = self.idx.query(
+            normalize_filters(method=["approve", "transfer"]), page_size=1
+        )
+        page2 = self.idx.query(
+            normalize_filters(method=["transfer", "approve"]),
+            page_size=10,
+            cursor=page1["next_cursor"],
+        )
+        self.assertEqual(hashes(page2), ["h2", "h3"])
+
+    def test_stats_with_set_filters(self):
+        stats = self.idx.stats(
+            normalize_filters(
+                from_address=["alice", "carol"], method=["mint", "transfer"]
+            )
+        )
+        self.assertEqual(stats["total_count"], 3)
+        self.assertEqual(stats["total_amount"], "80")
+        self.assertEqual(stats["min_amount"], "10")
+        self.assertEqual(stats["max_amount"], "40")
+        self.assertEqual(stats["avg_amount"], "26")  # 80 // 3
+
+    def test_stats_no_match_with_set_filters(self):
+        stats = self.idx.stats(normalize_filters(to_address=["nobody"]))
+        self.assertEqual(stats, {
+            "total_count": 0,
+            "total_amount": "0",
+            "min_amount": None,
+            "max_amount": None,
+            "avg_amount": None,
+        })
 
 
 class StatsTest(unittest.TestCase):
