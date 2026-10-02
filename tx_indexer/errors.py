@@ -1,0 +1,55 @@
+"""Tx Indexer 的异常类型。
+
+所有用户可见错误都携带 ``error``（错误码）与 ``message``（人类可读说明）；
+由输入数据行引起的错误还携带 ``input_line``（1 起始行号），其余错误为 None。
+"""
+
+
+class TxIndexerError(Exception):
+    """所有 Tx Indexer 错误的基类。"""
+
+    #: 错误码，子类覆盖
+    error = "error"
+
+    def __init__(self, message, input_line=None):
+        super().__init__(message)
+        self.message = message
+        self.input_line = input_line
+
+    def to_dict(self):
+        """返回结构化错误对象：error、message、input_line。"""
+        return {
+            "error": self.error,
+            "message": self.message,
+            "input_line": self.input_line,
+        }
+
+
+class InvalidTransactionError(TxIndexerError):
+    """记录解析或字段校验失败。"""
+
+    error = "invalid_transaction"
+
+
+class DuplicateTransactionError(TxIndexerError):
+    """tx_hash 与已加载记录冲突。"""
+
+    error = "duplicate_transaction"
+
+
+class InvalidTimeRangeError(TxIndexerError):
+    """时间窗倒置（start_time > end_time）。"""
+
+    error = "invalid_time_range"
+
+
+class InvalidPageSizeError(TxIndexerError):
+    """page_size 越界（不在 1..1000）或无法解析。"""
+
+    error = "invalid_page_size"
+
+
+class InvalidCursorError(TxIndexerError):
+    """游标非法（格式错误、解码失败）或与当前筛选不匹配。"""
+
+    error = "invalid_cursor"

@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""tx-indexer 命令行可执行入口（无需安装即可在仓库根目录运行）。"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from tx_indexer.cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())
