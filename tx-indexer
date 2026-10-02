@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# tx-indexer 命令行入口
+exec python3 "$(dirname "$(readlink -f "$0")")/tx_indexer.py" "$@"
