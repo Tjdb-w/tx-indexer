@@ -24,6 +24,7 @@ _CURSOR_VERSION = 1
 SCOPE_QUERY = "query"
 SCOPE_METHOD_STATS = "method-stats"
 SCOPE_ADDRESS_STATS = "address-stats"
+SCOPE_COUNTERPARTY_STATS = "counterparty-stats"
 
 
 def _as_sorted_list(value):
@@ -187,6 +188,56 @@ def decode_address_stats_cursor(token, filters):
     receive_count, address)``。
     """
     payload = _decode_payload(token, filters, SCOPE_ADDRESS_STATS)
+
+    after = payload.get("after")
+    if (
+        not isinstance(after, list)
+        or len(after) != 5
+        or not isinstance(after[0], int)
+        or isinstance(after[0], bool)
+        or after[0] < 0
+        or not isinstance(after[1], int)
+        or isinstance(after[1], bool)
+        or after[1] < 1
+        or not isinstance(after[2], int)
+        or isinstance(after[2], bool)
+        or after[2] < 0
+        or not isinstance(after[3], int)
+        or isinstance(after[3], bool)
+        or after[3] < 0
+        or not isinstance(after[4], str)
+        or after[4] == ""
+    ):
+        raise InvalidCursorError("游标位置信息非法", None)
+
+    return after[0], after[1], after[2], after[3], after[4]
+
+
+def encode_counterparty_stats_cursor(filters, after_total_amount,
+                                     after_total_count, after_send_count,
+                                     after_receive_count, after_counterparty):
+    payload = {
+        "v": _CURSOR_VERSION,
+        "c": SCOPE_COUNTERPARTY_STATS,
+        "f": _canonical_filters(filters),
+        "after": [
+            after_total_amount,
+            after_total_count,
+            after_send_count,
+            after_receive_count,
+            after_counterparty,
+        ],
+    }
+    return _encode_payload(payload)
+
+
+def decode_counterparty_stats_cursor(token, filters):
+    """解码并校验 counterparty-stats 游标。
+
+    返回 exclusive marker ``(total_amount, total_count, send_count,
+    receive_count, counterparty)``。
+    """
+    payload = _decode_payload(token, filters, SCOPE_COUNTERPARTY_STATS)
 
     after = payload.get("after")
     if (

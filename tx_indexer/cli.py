@@ -1,11 +1,12 @@
 """命令行入口：``tx-indexer query`` / ``stats`` / ``method-stats`` /
-``address-stats``。
+``address-stats`` / ``counterparty-stats``。
 
 用法：
     tx-indexer query <data.jsonl> [筛选与分页选项]
     tx-indexer stats <data.jsonl> [筛选选项]
     tx-indexer method-stats <data.jsonl> [筛选与分页选项]
     tx-indexer address-stats <data.jsonl> [筛选与分页选项]
+    tx-indexer counterparty-stats <data.jsonl> --address ADDR [筛选与分页选项]
 
 领域错误（invalid_transaction / duplicate_transaction / invalid_time_range /
 invalid_page_size / invalid_cursor / invalid_filter）以 JSON 对象输出到
@@ -19,7 +20,7 @@ import json
 import sys
 
 from .engine import DEFAULT_PAGE_SIZE, TxIndexer, normalize_filters
-from .errors import InvalidPageSizeError, TxIndexerError
+from .errors import InvalidFilterError, InvalidPageSizeError, TxIndexerError
 from .loader import load_file
 
 
@@ -123,6 +124,24 @@ def build_parser():
         "--cursor", help="上一页返回的 next_cursor"
     )
 
+    counterparty_stats_parser = subparsers.add_parser(
+        "counterparty-stats",
+        help="从观察地址按交易对手分页汇总"
+        "（返回 address/groups/total_groups/next_cursor）",
+    )
+    counterparty_stats_parser.add_argument(
+        "file", help="JSON Lines 数据文件路径"
+    )
+    _add_filter_args(counterparty_stats_parser)
+    counterparty_stats_parser.add_argument(
+        "--page-size",
+        default=str(DEFAULT_PAGE_SIZE),
+        help="每页分组数，1 到 1000，默认 100",
+    )
+    counterparty_stats_parser.add_argument(
+        "--cursor", help="上一页返回的 next_cursor"
+    )
+
     return parser
 
 
@@ -157,8 +176,18 @@ def main(argv=None):
     try:
         filters = _filters_from_args(args, parser)
         page_size = None
-        if args.command in ("query", "method-stats", "address-stats"):
+        if args.command in (
+            "query",
+            "method-stats",
+            "address-stats",
+            "counterparty-stats",
+        ):
             page_size = _parse_page_size(args.page_size)
+        # counterparty-stats 必须显式指定观察地址；在读取数据文件前报错
+        if args.command == "counterparty-stats" and filters["address"] is None:
+            raise InvalidFilterError(
+                "counterparty-stats 必须通过 --address 指定观察地址", None
+            )
 
         records = load_file(args.file)
         indexer = TxIndexer(records)
@@ -173,6 +202,10 @@ def main(argv=None):
             )
         elif args.command == "address-stats":
             result = indexer.address_stats(
+                filters, page_size=page_size, cursor=args.cursor
+            )
+        elif args.command == "counterparty-stats":
+            result = indexer.counterparty_stats(
                 filters, page_size=page_size, cursor=args.cursor
             )
         else:

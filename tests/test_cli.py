@@ -528,6 +528,260 @@ class CliTest(unittest.TestCase):
         self.assertEqual(payload["error"], "invalid_cursor")
         self.assertIsNone(payload["input_line"])
 
+    def test_counterparty_stats(self):
+        code, page1, _ = self._run([
+            "counterparty-stats", self.path,
+            "--address", "alice", "--page-size", "1"])
+        self.assertEqual(code, 0)
+        # h1 alice→bob 10、h2 bob→alice 21：对手 bob 合计 31
+        self.assertEqual(page1["address"], "alice")
+        self.assertEqual(page1["total_groups"], 2)
+        self.assertEqual(page1["groups"], [{
+            "counterparty": "bob",
+            "send_count": 1,
+            "receive_count": 1,
+            "total_count": 2,
+            "total_amount": "31",
+            "avg_amount": "15",
+        }])
+        self.assertIsNotNone(page1["next_cursor"])
+
+        code, page2, _ = self._run([
+            "counterparty-stats", self.path,
+            "--address", "alice", "--page-size", "1",
+            "--cursor", page1["next_cursor"],
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(page2["groups"], [{
+            "counterparty": "carol",
+            "send_count": 1,
+            "receive_count": 0,
+            "total_count": 1,
+            "total_amount": "5",
+            "avg_amount": "5",
+        }])
+        self.assertEqual(page2["address"], "alice")
+        self.assertEqual(page2["total_groups"], 2)
+        self.assertIsNone(page2["next_cursor"])
+
+    def test_counterparty_stats_walk_all_pages(self):
+        collected = []
+        cursor = None
+        while True:
+            argv = ["counterparty-stats", self.path,
+                    "--address", "alice", "--page-size", "1"]
+            if cursor is not None:
+                argv += ["--cursor", cursor]
+            code, page, _ = self._run(argv)
+            self.assertEqual(code, 0)
+            self.assertEqual(page["address"], "alice")
+            collected.extend(g["counterparty"] for g in page["groups"])
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(collected, ["bob", "carol"])
+
+    def test_counterparty_stats_self_transfer(self):
+        path = os.path.join(self.tmp.name, "self_cp.jsonl")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "tx_hash": "s1", "block_number": 1, "timestamp": 1,
+                "from_address": "eva", "to_address": "eva",
+                "method": "m", "amount": "100",
+            }) + "\n")
+            fh.write(json.dumps({
+                "tx_hash": "o1", "block_number": 2, "timestamp": 2,
+                "from_address": "eva", "to_address": "fin",
+                "method": "m", "amount": "8",
+            }) + "\n")
+        code, page, _ = self._run(
+            ["counterparty-stats", path, "--address", "eva"])
+        self.assertEqual(code, 0)
+        # eva 100 在前（total_amount 降序），fin 8 在后
+        self.assertEqual(page["total_groups"], 2)
+        self.assertEqual(page["groups"], [
+            {"counterparty": "eva", "send_count": 1, "receive_count": 1,
+             "total_count": 1, "total_amount": "100", "avg_amount": "100"},
+            {"counterparty": "fin", "send_count": 1, "receive_count": 0,
+             "total_count": 1, "total_amount": "8", "avg_amount": "8"},
+        ])
+        self.assertIsNone(page["next_cursor"])
+
+    def test_counterparty_stats_no_match(self):
+        code, page, _ = self._run([
+            "counterparty-stats", self.path,
+            "--address", "nobody", "--method", "x"])
+        self.assertEqual(code, 0)
+        self.assertEqual(page, {
+            "address": "nobody",
+            "groups": [],
+            "total_groups": 0,
+            "next_cursor": None,
+        })
+
+    def test_counterparty_stats_default_page_size_is_100(self):
+        code, page, _ = self._run([
+            "counterparty-stats", self.path, "--address", "alice"])
+        self.assertEqual(code, 0)
+        self.assertEqual(page["total_groups"], 2)
+        self.assertIsNone(page["next_cursor"])
+
+    def test_counterparty_stats_filters(self):
+        code, page, _ = self._run([
+            "counterparty-stats", self.path,
+            "--address", "alice",
+            "--start-time", "15",
+        ])
+        self.assertEqual(code, 0)
+        # h2 bob→alice 21、h3 alice→carol 5；h1 在窗外
+        self.assertEqual(
+            [g["counterparty"] for g in page["groups"]], ["bob", "carol"]
+        )
+        self.assertEqual(page["groups"][0]["total_amount"], "21")
+
+    def test_counterparty_stats_missing_address_exit_2_before_file_read(self):
+        # 数据文件不存在：缺少 --address 必须在读文件前报 invalid_filter
+        missing = os.path.join(self.tmp.name, "missing.jsonl")
+        code, out, err = self._run(["counterparty-stats", missing])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_filter")
+        self.assertIsNone(payload["input_line"])
+
+    def test_counterparty_stats_blank_address_exit_2(self):
+        code, out, err = self._run([
+            "counterparty-stats", self.path, "--address", "  "])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_filter")
+
+    def test_counterparty_stats_address_conflict_exit_2(self):
+        missing = os.path.join(self.tmp.name, "missing.jsonl")
+        for extra in (["--from-address", "bob"], ["--to-address", "bob"]):
+            code, out, err = self._run(
+                ["counterparty-stats", missing,
+                 "--address", "alice"] + extra)
+            self.assertEqual(code, 2)
+            self.assertIsNone(out)
+            payload = json.loads(err)
+            self.assertEqual(payload["error"], "invalid_filter")
+            self.assertIsNone(payload["input_line"])
+
+    def test_counterparty_stats_invalid_time_range_exit_2(self):
+        code, out, err = self._run([
+            "counterparty-stats", self.path, "--address", "alice",
+            "--start-time", "100", "--end-time", "1"])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        self.assertEqual(
+            json.loads(err)["error"], "invalid_time_range"
+        )
+
+    def test_counterparty_stats_invalid_page_size_exit_2(self):
+        code, out, err = self._run([
+            "counterparty-stats", self.path,
+            "--address", "alice", "--page-size", "1001"])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_page_size")
+        self.assertIsNone(payload["input_line"])
+
+    def test_counterparty_stats_cross_command_cursor_exit_2(self):
+        for source in ("query", "method-stats", "address-stats"):
+            code, src_page, _ = self._run(
+                [source, self.path, "--page-size", "1"])
+            self.assertEqual(code, 0)
+            code, out, err = self._run([
+                "counterparty-stats", self.path,
+                "--address", "alice",
+                "--cursor", src_page["next_cursor"],
+            ])
+            self.assertEqual(code, 2)
+            self.assertIsNone(out)
+            payload = json.loads(err)
+            self.assertEqual(payload["error"], "invalid_cursor")
+            self.assertIsNone(payload["input_line"])
+
+        # 反向：counterparty-stats 游标用于其他命令同样拒绝
+        code, cp_page, _ = self._run([
+            "counterparty-stats", self.path,
+            "--address", "alice", "--page-size", "1"])
+        self.assertEqual(code, 0)
+        for target in ("query", "method-stats", "address-stats"):
+            argv = [target, self.path,
+                    "--cursor", cp_page["next_cursor"]]
+            if target != "query":
+                argv += ["--address", "alice"]
+            code, out, err = self._run(argv)
+            self.assertEqual(code, 2)
+            self.assertEqual(
+                json.loads(err)["error"], "invalid_cursor"
+            )
+
+    def test_counterparty_stats_cursor_bound_to_filters(self):
+        code, page1, _ = self._run([
+            "counterparty-stats", self.path,
+            "--address", "alice", "--page-size", "1"])
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(page1["next_cursor"])
+
+        # 改变观察地址复用旧游标 → invalid_cursor
+        code, out, err = self._run([
+            "counterparty-stats", self.path,
+            "--address", "bob", "--page-size", "1",
+            "--cursor", page1["next_cursor"]])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_cursor")
+        self.assertIsNone(payload["input_line"])
+
+        # 改变其他筛选同样拒绝
+        code, out, err = self._run([
+            "counterparty-stats", self.path,
+            "--address", "alice", "--method", "transfer",
+            "--page-size", "1", "--cursor", page1["next_cursor"]])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(err)["error"], "invalid_cursor")
+
+        # 游标不绑定 page-size：page_size=1 的游标可在 page_size=100 续页
+        code, page2, _ = self._run([
+            "counterparty-stats", self.path,
+            "--address", "alice", "--page-size", "100",
+            "--cursor", page1["next_cursor"]])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [g["counterparty"] for g in page2["groups"]], ["carol"]
+        )
+        self.assertIsNone(page2["next_cursor"])
+
+    def test_counterparty_stats_data_error_has_line_no(self):
+        bad = os.path.join(self.tmp.name, "bad_cp.jsonl")
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(DATA_LINES[0]) + "\n")
+            fh.write("{broken\n")
+        code, _, err = self._run(
+            ["counterparty-stats", bad, "--address", "alice"])
+        self.assertEqual(code, 2)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_transaction")
+        self.assertEqual(payload["input_line"], 2)
+
+    def test_counterparty_stats_duplicate_has_line_no(self):
+        dup = os.path.join(self.tmp.name, "dup_cp.jsonl")
+        with open(dup, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(DATA_LINES[0]) + "\n")
+            fh.write(json.dumps(DATA_LINES[0]) + "\n")
+        code, _, err = self._run(
+            ["counterparty-stats", dup, "--address", "alice"])
+        self.assertEqual(code, 2)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "duplicate_transaction")
+        self.assertEqual(payload["input_line"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

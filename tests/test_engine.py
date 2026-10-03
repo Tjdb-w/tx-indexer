@@ -677,5 +677,299 @@ class AddressStatsTest(unittest.TestCase):
         self.assertEqual(groups["b"]["avg_amount"], big)
 
 
+class CounterpartyStatsTest(unittest.TestCase):
+    def setUp(self):
+        self.records = [
+            rec("a", 1, 10, "alice", "bob", "transfer", "10"),
+            rec("b", 2, 20, "bob", "alice", "transfer", "21"),
+            rec("c", 3, 30, "carol", "dave", "approve", "100"),
+            rec("d", 4, 40, "alice", "carol", "mint", "15"),
+        ]
+        self.idx = TxIndexer(self.records)
+
+    def test_grouping_and_aggregation(self):
+        result = self.idx.counterparty_stats(
+            normalize_filters(address="alice")
+        )
+        self.assertEqual(result["address"], "alice")
+        # carol→dave 与观察地址无关，不计入
+        self.assertEqual(
+            [(g["counterparty"], g["send_count"], g["receive_count"],
+              g["total_count"], g["total_amount"], g["avg_amount"])
+             for g in result["groups"]],
+            [
+                ("bob", 1, 1, 2, "31", "15"),  # 31 // 2
+                ("carol", 1, 0, 1, "15", "15"),
+            ],
+        )
+        self.assertEqual(result["total_groups"], 2)
+        self.assertIsNone(result["next_cursor"])
+
+    def test_group_field_order(self):
+        result = self.idx.counterparty_stats(
+            normalize_filters(address="alice")
+        )
+        group = result["groups"][0]
+        self.assertEqual(
+            list(group.keys()),
+            ["counterparty", "send_count", "receive_count", "total_count",
+             "total_amount", "avg_amount"],
+        )
+        self.assertEqual(
+            list(result.keys()),
+            ["address", "groups", "total_groups", "next_cursor"],
+        )
+        self.assertIsInstance(group["total_amount"], str)
+        self.assertIsInstance(group["avg_amount"], str)
+
+    def test_send_and_receive_roles_assigned_once_per_tx(self):
+        records = [
+            rec("h1", 1, 1, "a", "x", "m", "5"),   # a 发送：对手 x
+            rec("h2", 2, 2, "x", "a", "m", "6"),   # a 接收：对手 x
+            rec("h3", 3, 3, "y", "a", "m", "7"),   # a 接收：对手 y
+            rec("h4", 4, 4, "z", "z", "m", "8"),   # 与 a 无关
+        ]
+        result = TxIndexer(records).counterparty_stats(
+            normalize_filters(address="a")
+        )
+        groups = {g["counterparty"]: g for g in result["groups"]}
+        self.assertEqual(set(groups), {"x", "y"})
+        self.assertEqual(
+            (groups["x"]["send_count"], groups["x"]["receive_count"],
+             groups["x"]["total_count"], groups["x"]["total_amount"]),
+            (1, 1, 2, "11"),
+        )
+        self.assertEqual(
+            (groups["y"]["send_count"], groups["y"]["receive_count"],
+             groups["y"]["total_count"], groups["y"]["total_amount"]),
+            (0, 1, 1, "7"),
+        )
+
+    def test_self_transfer_is_own_counterparty_once(self):
+        records = [
+            rec("s1", 1, 1, "eva", "eva", "m", "100"),
+            rec("s2", 2, 2, "eva", "eva", "m", "50"),
+            rec("o1", 3, 3, "fin", "gus", "m", "7"),
+        ]
+        result = TxIndexer(records).counterparty_stats(
+            normalize_filters(address="eva")
+        )
+        self.assertEqual(result["total_groups"], 1)
+        eva = result["groups"][0]
+        self.assertEqual(eva["counterparty"], "eva")
+        self.assertEqual(eva["send_count"], 2)
+        self.assertEqual(eva["receive_count"], 2)
+        self.assertEqual(eva["total_count"], 2)
+        self.assertEqual(eva["total_amount"], "150")  # 金额只累计一次
+        self.assertEqual(eva["avg_amount"], "75")
+
+    def test_self_transfer_mixed_with_normal(self):
+        records = [
+            rec("s1", 1, 1, "a", "a", "m", "10"),
+            rec("o1", 2, 2, "a", "b", "m", "5"),
+            rec("i1", 3, 3, "b", "a", "m", "7"),
+        ]
+        groups = {
+            g["counterparty"]: g
+            for g in TxIndexer(records).counterparty_stats(
+                normalize_filters(address="a")
+            )["groups"]
+        }
+        self.assertEqual(set(groups), {"a", "b"})
+        a = groups["a"]
+        self.assertEqual(
+            (a["send_count"], a["receive_count"], a["total_count"]),
+            (1, 1, 1),
+        )
+        self.assertEqual(a["total_amount"], "10")
+        b = groups["b"]
+        self.assertEqual(
+            (b["send_count"], b["receive_count"], b["total_count"]),
+            (1, 1, 2),
+        )
+        self.assertEqual(b["total_amount"], "12")
+
+    def test_sort_amount_then_count_then_send_then_counterparty(self):
+        records = [
+            # x 总额 10、count 2；y 总额 10、count 1 → x 在前
+            rec("h1", 1, 1, "a", "x", "m", "5"),
+            rec("h2", 2, 2, "a", "x", "m", "5"),
+            rec("h3", 3, 3, "a", "y", "m", "10"),
+            # w、z 均为接收方对手：总额 8、count 1、send 0 → 按码点
+            rec("h4", 4, 4, "w", "a", "m", "8"),
+            rec("h5", 5, 5, "z", "a", "m", "8"),
+        ]
+        result = TxIndexer(records).counterparty_stats(
+            normalize_filters(address="a")
+        )
+        self.assertEqual(
+            [g["counterparty"] for g in result["groups"]],
+            ["x", "y", "w", "z"],
+        )
+
+    def test_pagination_no_skip_no_dup_no_reorder(self):
+        filters = normalize_filters(address="alice")
+        all_names = [
+            g["counterparty"]
+            for g in self.idx.counterparty_stats(
+                filters, page_size=100
+            )["groups"]
+        ]
+        collected = []
+        cursor = None
+        pages = 0
+        while True:
+            page = self.idx.counterparty_stats(
+                filters, page_size=1, cursor=cursor
+            )
+            pages += 1
+            collected.extend(g["counterparty"] for g in page["groups"])
+            self.assertEqual(page["address"], "alice")
+            self.assertEqual(page["total_groups"], 2)
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(pages, 2)
+        self.assertEqual(collected, all_names)
+        self.assertEqual(collected, ["bob", "carol"])
+
+    def test_cursor_not_bound_to_page_size(self):
+        filters = normalize_filters(address="alice")
+        page1 = self.idx.counterparty_stats(filters, page_size=1)
+        self.assertIsNotNone(page1["next_cursor"])
+        # 换更大 page-size 续页不跳过、不重复
+        page2 = self.idx.counterparty_stats(
+            filters, page_size=100, cursor=page1["next_cursor"]
+        )
+        self.assertEqual(
+            [g["counterparty"] for g in page2["groups"]], ["carol"]
+        )
+        self.assertIsNone(page2["next_cursor"])
+
+    def test_last_page_partial_returns_null_cursor(self):
+        page = self.idx.counterparty_stats(
+            normalize_filters(address="alice"), page_size=1
+        )
+        self.assertIsNotNone(page["next_cursor"])
+        last = self.idx.counterparty_stats(
+            normalize_filters(address="alice"), page_size=1,
+            cursor=page["next_cursor"]
+        )
+        self.assertEqual(len(last["groups"]), 1)
+        self.assertIsNone(last["next_cursor"])
+
+    def test_no_match_keeps_address(self):
+        result = self.idx.counterparty_stats(
+            normalize_filters(address="nobody")
+        )
+        self.assertEqual(result, {
+            "address": "nobody",
+            "groups": [],
+            "total_groups": 0,
+            "next_cursor": None,
+        })
+
+    def test_other_filters_intersect_before_grouping(self):
+        result = self.idx.counterparty_stats(
+            normalize_filters(address="alice", method="transfer")
+        )
+        # 只剩 h1、h2，两笔对手都是 bob
+        self.assertEqual(result["total_groups"], 1)
+        bob = result["groups"][0]
+        self.assertEqual(bob["counterparty"], "bob")
+        self.assertEqual(bob["total_count"], 2)
+        self.assertEqual(bob["total_amount"], "31")
+
+    def test_time_window_filter(self):
+        result = self.idx.counterparty_stats(
+            normalize_filters(address="alice", start_time=15, end_time=35)
+        )
+        # h2(bob→alice 21) 命中；h1/h4 在窗外
+        self.assertEqual(
+            [g["counterparty"] for g in result["groups"]], ["bob"]
+        )
+        self.assertEqual(result["groups"][0]["receive_count"], 1)
+
+    def test_requires_address(self):
+        with self.assertRaises(InvalidFilterError):
+            self.idx.counterparty_stats(normalize_filters())
+
+    def test_page_size_bounds(self):
+        filters = normalize_filters(address="alice")
+        with self.assertRaises(InvalidPageSizeError):
+            self.idx.counterparty_stats(filters, page_size=0)
+        with self.assertRaises(InvalidPageSizeError):
+            self.idx.counterparty_stats(filters, page_size=1001)
+        with self.assertRaises(InvalidPageSizeError):
+            self.idx.counterparty_stats(filters, page_size="10")
+
+    def test_cursor_filter_mismatch(self):
+        page1 = self.idx.counterparty_stats(
+            normalize_filters(address="alice"), page_size=1
+        )
+        cursor = page1["next_cursor"]
+        # 改变观察地址 → invalid_cursor
+        with self.assertRaises(InvalidCursorError):
+            self.idx.counterparty_stats(
+                normalize_filters(address="bob"), page_size=1, cursor=cursor
+            )
+        # 改变其他筛选 → invalid_cursor
+        with self.assertRaises(InvalidCursorError):
+            self.idx.counterparty_stats(
+                normalize_filters(address="alice", method="mint"),
+                page_size=1,
+                cursor=cursor,
+            )
+
+    def test_cursor_cross_command_rejected(self):
+        from tx_indexer.cursor import (
+            decode_address_stats_cursor,
+            decode_counterparty_stats_cursor,
+            decode_cursor,
+            decode_method_stats_cursor,
+            encode_address_stats_cursor,
+            encode_counterparty_stats_cursor,
+            encode_cursor,
+            encode_method_stats_cursor,
+        )
+
+        filters = normalize_filters(address="alice")
+        cp_cursor = encode_counterparty_stats_cursor(
+            filters, 10, 1, 1, 0, "bob"
+        )
+        query_cursor = encode_cursor(filters, 1, "h1")
+        method_cursor = encode_method_stats_cursor(filters, 10, 1, "m")
+        address_cursor = encode_address_stats_cursor(
+            filters, 10, 1, 1, 0, "a"
+        )
+        for decoder in (
+            decode_cursor,
+            decode_method_stats_cursor,
+            decode_address_stats_cursor,
+        ):
+            with self.assertRaises(InvalidCursorError):
+                decoder(cp_cursor, filters)
+        for other in (query_cursor, method_cursor, address_cursor):
+            with self.assertRaises(InvalidCursorError):
+                decode_counterparty_stats_cursor(other, filters)
+
+    def test_cursor_garbage(self):
+        for bad in ("", "not-base64!!!", "bm9wZQ", "%%%"):
+            with self.assertRaises(InvalidCursorError):
+                self.idx.counterparty_stats(
+                    normalize_filters(address="alice"), cursor=bad
+                )
+
+    def test_big_amounts_exact_decimal(self):
+        big = "123456789012345678901234567890"
+        idx = TxIndexer([rec("x", 1, 1, "a", "b", "m", big)])
+        group = idx.counterparty_stats(
+            normalize_filters(address="a")
+        )["groups"][0]
+        self.assertEqual(group["counterparty"], "b")
+        self.assertEqual(group["total_amount"], big)
+        self.assertEqual(group["avg_amount"], big)
+
+
 if __name__ == "__main__":
     unittest.main()
