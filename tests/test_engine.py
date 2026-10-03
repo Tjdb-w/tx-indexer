@@ -463,5 +463,193 @@ class MethodStatsTest(unittest.TestCase):
         self.assertEqual(group["avg_amount"], big)
 
 
+class AddressStatsTest(unittest.TestCase):
+    def setUp(self):
+        self.records = [
+            rec("a", 1, 10, "alice", "bob", "transfer", "10"),
+            rec("b", 2, 20, "bob", "alice", "transfer", "21"),
+            rec("c", 3, 30, "carol", "dave", "approve", "100"),
+            rec("d", 4, 40, "alice", "carol", "mint", "15"),
+            rec("e", 5, 50, "bob", "bob", "transfer", "7"),
+        ]
+        self.idx = TxIndexer(self.records)
+
+    def test_grouping_and_aggregation(self):
+        result = self.idx.address_stats(normalize_filters())
+        groups = {
+            g["address"]: g for g in result["groups"]
+        }
+        self.assertEqual(result["total_groups"], 4)
+        self.assertIsNone(result["next_cursor"])
+        # alice：发送 a/d（10+15），接收 b（21），共 3 笔参与
+        self.assertEqual(
+            (
+                groups["alice"]["send_count"],
+                groups["alice"]["receive_count"],
+                groups["alice"]["total_count"],
+                groups["alice"]["total_amount"],
+                groups["alice"]["avg_amount"],
+            ),
+            (2, 1, 3, "46", "15"),  # 46 // 3
+        )
+        # bob：发送 b/e，接收 a/e（含自转账 e），共 3 笔参与
+        self.assertEqual(
+            (
+                groups["bob"]["send_count"],
+                groups["bob"]["receive_count"],
+                groups["bob"]["total_count"],
+                groups["bob"]["total_amount"],
+            ),
+            (2, 2, 3, "38"),
+        )
+
+    def test_self_transfer_counts_once(self):
+        idx = TxIndexer([rec("s", 1, 1, "eve", "eve", "transfer", "9")])
+        result = idx.address_stats(normalize_filters())
+        self.assertEqual(result["total_groups"], 1)
+        group = result["groups"][0]
+        self.assertEqual(group, {
+            "address": "eve",
+            "send_count": 1,
+            "receive_count": 1,
+            "total_count": 1,
+            "total_amount": "9",
+            "avg_amount": "9",
+        })
+
+    def test_group_field_order(self):
+        group = self.idx.address_stats(normalize_filters())["groups"][0]
+        self.assertEqual(
+            list(group.keys()),
+            ["address", "send_count", "receive_count", "total_count",
+             "total_amount", "avg_amount"],
+        )
+        self.assertIsInstance(group["total_amount"], str)
+        self.assertIsInstance(group["avg_amount"], str)
+
+    def test_sort_full_key_chain(self):
+        records = [
+            # gamma/alpha/omega 总额、参与数相同，按发送数降序区分
+            rec("h1", 1, 1, "gamma", "p1", "m", "6"),
+            rec("h2", 2, 2, "gamma", "p2", "m", "4"),
+            rec("h3", 3, 3, "q1", "alpha", "m", "5"),
+            rec("h4", 4, 4, "alpha", "q2", "m", "5"),
+            rec("h5", 5, 5, "q3", "omega", "m", "5"),
+            rec("h6", 6, 6, "q4", "omega", "m", "5"),
+            # beta/zeta 总额、参与数、发送、接收全同，按码点升序
+            rec("h7", 7, 7, "beta", "p3", "m", "10"),
+            rec("h8", 8, 8, "zeta", "p4", "m", "10"),
+        ]
+        result = TxIndexer(records).address_stats(normalize_filters())
+        self.assertEqual(
+            [g["address"] for g in result["groups"]],
+            [
+                # total_amount=10：count=2 的按 send_count 降序
+                "gamma", "alpha", "omega",
+                # count=1：send=1 的 beta/zeta 按码点，再到 send=0 的 p3/p4
+                "beta", "zeta", "p3", "p4",
+                # total_amount=6 / 5（send 降序、码点升序）/ 4
+                "p1", "q1", "q3", "q4", "q2", "p2",
+            ],
+        )
+
+    def test_pagination_no_skip_no_dup_no_reorder(self):
+        filters = normalize_filters()
+        all_addresses = [
+            g["address"]
+            for g in self.idx.address_stats(filters, page_size=100)["groups"]
+        ]
+        collected = []
+        cursor = None
+        pages = 0
+        while True:
+            page = self.idx.address_stats(
+                filters, page_size=2, cursor=cursor
+            )
+            pages += 1
+            collected.extend(g["address"] for g in page["groups"])
+            self.assertEqual(page["total_groups"], 4)
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(pages, 2)  # 4 组、page_size=2：恰好 2 页
+        self.assertEqual(collected, all_addresses)
+
+    def test_last_page_partial_returns_null_cursor(self):
+        page = self.idx.address_stats(normalize_filters(), page_size=3)
+        self.assertIsNotNone(page["next_cursor"])
+        last = self.idx.address_stats(
+            normalize_filters(), page_size=3, cursor=page["next_cursor"]
+        )
+        self.assertEqual(len(last["groups"]), 1)
+        self.assertIsNone(last["next_cursor"])
+
+    def test_no_match(self):
+        result = self.idx.address_stats(normalize_filters(method="nope"))
+        self.assertEqual(result, {
+            "groups": [],
+            "total_groups": 0,
+            "next_cursor": None,
+        })
+
+    def test_filters_intersect_before_grouping(self):
+        result = self.idx.address_stats(
+            normalize_filters(from_address=["alice"], method=["mint"])
+        )
+        self.assertEqual(
+            [(g["address"], g["send_count"], g["receive_count"])
+             for g in result["groups"]],
+            [("alice", 1, 0), ("carol", 0, 1)],
+        )
+        self.assertEqual(result["total_groups"], 2)
+
+    def test_page_size_bounds(self):
+        with self.assertRaises(InvalidPageSizeError):
+            self.idx.address_stats(normalize_filters(), page_size=0)
+        with self.assertRaises(InvalidPageSizeError):
+            self.idx.address_stats(normalize_filters(), page_size=1001)
+        with self.assertRaises(InvalidPageSizeError):
+            self.idx.address_stats(normalize_filters(), page_size="10")
+
+    def test_cursor_filter_mismatch(self):
+        page1 = self.idx.address_stats(
+            normalize_filters(), page_size=1
+        )
+        cursor = page1["next_cursor"]
+        with self.assertRaises(InvalidCursorError):
+            self.idx.address_stats(
+                normalize_filters(method="mint"), page_size=1, cursor=cursor
+            )
+
+    def test_cursor_cross_command_rejected(self):
+        from tx_indexer.cursor import (
+            decode_address_stats_cursor,
+            decode_method_stats_cursor,
+            encode_address_stats_cursor,
+            encode_method_stats_cursor,
+        )
+
+        filters = normalize_filters()
+        address_cursor = encode_address_stats_cursor(filters, 10, 1, 1, 0, "a")
+        method_cursor = encode_method_stats_cursor(filters, 10, 1, "m")
+        with self.assertRaises(InvalidCursorError):
+            decode_method_stats_cursor(address_cursor, filters)
+        with self.assertRaises(InvalidCursorError):
+            decode_address_stats_cursor(method_cursor, filters)
+
+    def test_cursor_garbage(self):
+        for bad in ("", "not-base64!!!", "bm9wZQ", "%%%"):
+            with self.assertRaises(InvalidCursorError):
+                self.idx.address_stats(normalize_filters(), cursor=bad)
+
+    def test_big_amounts_exact_decimal(self):
+        big = "123456789012345678901234567890"
+        idx = TxIndexer([rec("x", 1, 1, "a", "b", "m", big)])
+        groups = idx.address_stats(normalize_filters())["groups"]
+        for group in groups:
+            self.assertEqual(group["total_amount"], big)
+            self.assertEqual(group["avg_amount"], big)
+
+
 if __name__ == "__main__":
     unittest.main()
