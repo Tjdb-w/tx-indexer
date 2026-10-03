@@ -27,11 +27,12 @@
 ```bash
 ./tx-indexer query <data.jsonl> [选项]
 ./tx-indexer stats <data.jsonl> [选项]
+./tx-indexer method-stats <data.jsonl> [选项]
 ```
 
 也可以用 `python3 -m tx_indexer ...`。
 
-筛选选项（两类命令通用，不同条件之间取交集；时间窗左闭右闭）：
+筛选选项（三类命令通用，不同条件之间取交集；时间窗左闭右闭）：
 
 - `--address ADDR`：精确匹配发送方或接收方（不可与 `--from-address` / `--to-address` 并用）
 - `--from-address ADDR`：精确匹配发送方，可重复出现，集合内任一命中
@@ -41,7 +42,7 @@
 
 集合类选项（`--from-address` / `--to-address` / `--method`）重复给定相同值等同一个条件。筛选值为空或仅含空白、或 `--address` 与付款方/收款方筛选并用，会在读取数据文件前报 `invalid_filter`。
 
-`query` 额外选项：
+`query` 与 `method-stats` 的额外选项：
 
 - `--page-size N`：每页条数，默认 `100`，范围 1..1000
 - `--cursor TOKEN`：上一页返回的 `next_cursor`
@@ -77,6 +78,25 @@
 
 无匹配时：`total_count` 为 `0`、`total_amount` 为 `"0"`，其余三项为 `null`。
 
+### method-stats 返回
+
+把匹配交易按 `method` 的精确字符串值分组，使用与 query/stats 相同的筛选。组按 `total_amount` 数值降序、再按 `total_count` 降序、再按 `method` 的 Unicode 码点升序排列；金额均为十进制整数字符串，`avg_amount` 向下取整：
+
+```json
+{
+  "groups": [
+    {"method": "approve", "total_count": 1, "total_amount": "21", "avg_amount": "21"},
+    {"method": "transfer", "total_count": 2, "total_amount": "15", "avg_amount": "7"}
+  ],
+  "total_groups": 2,
+  "next_cursor": null
+}
+```
+
+- `total_groups` 为全部分组数（不是当前页组数）。
+- `next_cursor` 末页为 `null`；游标不透明且自校验，只允许在相同命令及等价筛选条件下续用，跨命令复用（如把 query 的游标用于 method-stats）或改变筛选都会报 `invalid_cursor`。
+- 无匹配时：`groups` 为 `[]`、`total_groups` 为 `0`、`next_cursor` 为 `null`。
+
 ## 错误处理
 
 领域错误输出到 stderr（单行 JSON，含 `error`、`message`、`input_line`），退出码为 `2`。只有输入数据行错误才带 1 起始行号，其余错误 `input_line` 为 `null`。
@@ -87,7 +107,7 @@
 | `duplicate_transaction` | `tx_hash` 冲突（含冲突所在行号） |
 | `invalid_time_range` | 时间窗倒置（`start_time > end_time`） |
 | `invalid_page_size` | `page_size` 越界或无法解析 |
-| `invalid_cursor` | 游标非法（格式/解码错误）或与当前筛选不匹配 |
+| `invalid_cursor` | 游标非法（格式/解码错误）、跨命令复用或与当前筛选不匹配 |
 | `invalid_filter` | 筛选值为空白，或 `--address` 与 `--from-address` / `--to-address` 并用（读取数据文件前报错） |
 
 ## 代码结构
@@ -101,4 +121,4 @@
 
 ## 状态
 
-已实现：公开查询、游标分页、聚合统计与六类异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选。
+已实现：公开查询、游标分页、聚合统计、按 method 分组的分页统计与六类异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选。

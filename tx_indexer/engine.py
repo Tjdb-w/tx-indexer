@@ -10,11 +10,21 @@
 排序：block_number 升序，同高度按 tx_hash 升序。
 分页：不透明 keyset 游标（见 :mod:`tx_indexer.cursor`），相同筛选下
 不跳过、不重复、不乱序；``total`` 始终为全部匹配数。
+
+``method_stats`` 把匹配交易按 method 精确字符串分组，组内汇总
+total_count / total_amount / avg_amount（向下取整）；分组按
+total_amount 降序、total_count 降序、method Unicode 码点升序排列，
+游标分页返回 ``total_groups``（全部分组数）。
 """
 
 import bisect
 
-from .cursor import decode_cursor, encode_cursor
+from .cursor import (
+    COMMAND_METHOD_STATS,
+    COMMAND_QUERY,
+    decode_cursor,
+    encode_cursor,
+)
 from .errors import (
     InvalidFilterError,
     InvalidPageSizeError,
@@ -162,7 +172,9 @@ class TxIndexer:
 
         start = 0
         if cursor is not None:
-            after_block, after_tx_hash = decode_cursor(cursor, filters)
+            after_block, after_tx_hash = decode_cursor(
+                cursor, filters, COMMAND_QUERY
+            )
             # keyset 续页：排序键严格大于 marker 的第一个位置。
             # marker 位于两键之间也安全（bisect 取下一键），不会跳过或重复。
             keys = [(r["block_number"], r["tx_hash"]) for r in matched]
@@ -176,7 +188,9 @@ class TxIndexer:
         if end < total:
             last = page[-1]
             next_cursor = encode_cursor(
-                filters, last["block_number"], last["tx_hash"]
+                filters,
+                COMMAND_QUERY,
+                (last["block_number"], last["tx_hash"]),
             )
         else:
             next_cursor = None
@@ -218,4 +232,78 @@ class TxIndexer:
             "min_amount": str(min_amount),
             "max_amount": str(max_amount),
             "avg_amount": str(total_amount // count),
+        }
+
+    @staticmethod
+    def _method_groups(filters, records):
+        """按 method 精确字符串聚合匹配记录，返回排好序的组列表。"""
+        totals = {}
+        for record in records:
+            if not _matches(record, filters):
+                continue
+            method = record["method"]
+            count, amount = totals.get(method, (0, 0))
+            totals[method] = (count + 1, amount + int(record["amount"]))
+
+        groups = [
+            {
+                "method": method,
+                "total_count": count,
+                "total_amount": amount,
+            }
+            for method, (count, amount) in totals.items()
+        ]
+        # total_amount 降序、total_count 降序、method Unicode 码点升序
+        groups.sort(key=lambda g: (-g["total_amount"], -g["total_count"],
+                                   g["method"]))
+        return groups
+
+    def method_stats(self, filters, page_size=DEFAULT_PAGE_SIZE, cursor=None):
+        """按 method 分组的分页统计。
+
+        返回 {groups, total_groups, next_cursor}；金额为十进制整数
+        字符串，avg_amount 向下取整。
+        """
+        self._validate_page_size(page_size)
+
+        groups = self._method_groups(filters, self._records)
+        total_groups = len(groups)
+
+        start = 0
+        if cursor is not None:
+            after_amount, after_count, after_method = decode_cursor(
+                cursor, filters, COMMAND_METHOD_STATS
+            )
+            # 升序键空间：(-total_amount, -total_count, method)
+            keys = [(-g["total_amount"], -g["total_count"], g["method"])
+                    for g in groups]
+            marker = (-after_amount, -after_count, after_method)
+            start = bisect.bisect_left(keys, marker)
+            if start < total_groups and keys[start] == marker:
+                start += 1
+
+        end = start + page_size
+        page = groups[start:end]
+        if end < total_groups:
+            last = page[-1]
+            next_cursor = encode_cursor(
+                filters,
+                COMMAND_METHOD_STATS,
+                (last["total_amount"], last["total_count"], last["method"]),
+            )
+        else:
+            next_cursor = None
+
+        return {
+            "groups": [
+                {
+                    "method": g["method"],
+                    "total_count": g["total_count"],
+                    "total_amount": str(g["total_amount"]),
+                    "avg_amount": str(g["total_amount"] // g["total_count"]),
+                }
+                for g in page
+            ],
+            "total_groups": total_groups,
+            "next_cursor": next_cursor,
         }

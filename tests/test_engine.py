@@ -319,5 +319,164 @@ class StatsTest(unittest.TestCase):
         self.assertEqual(stats["avg_amount"], big)
 
 
+class MethodStatsTest(unittest.TestCase):
+    def setUp(self):
+        self.records = [
+            rec("h1", 1, 10, "alice", "bob", "transfer", "10"),
+            rec("h2", 2, 20, "bob", "alice", "approve", "100"),
+            rec("h3", 3, 30, "alice", "carol", "transfer", "20"),
+            rec("h4", 4, 40, "carol", "dave", "mint", "50"),
+            rec("h5", 5, 50, "alice", "dave", "mint", "10"),
+        ]
+        self.idx = TxIndexer(self.records)
+
+    def test_grouping_amounts_and_floor_avg(self):
+        result = self.idx.method_stats(normalize_filters())
+        self.assertEqual(result["total_groups"], 3)
+        self.assertIsNone(result["next_cursor"])
+        groups = result["groups"]
+        # transfer: 10+20=30/2=15；mint: 50+10=60/2=30；approve: 100/1=100
+        self.assertEqual(groups, [
+            {"method": "approve", "total_count": 1,
+             "total_amount": "100", "avg_amount": "100"},
+            {"method": "mint", "total_count": 2,
+             "total_amount": "60", "avg_amount": "30"},
+            {"method": "transfer", "total_count": 2,
+             "total_amount": "30", "avg_amount": "15"},
+        ])
+
+    def test_order_amount_desc_then_count_desc_then_method_asc(self):
+        # z: 金额 100 最高；b 与 a/c 金额并列 10，但 b count=2 优先；
+        # a 与 c 金额、count 均并列 → method 码点升序
+        records = [
+            rec("z1", 1, 1, "x", "y", "z", "100"),
+            rec("b1", 2, 2, "x", "y", "b", "5"),
+            rec("b2", 3, 3, "x", "y", "b", "5"),
+            rec("a1", 4, 4, "x", "y", "a", "10"),
+            rec("c1", 5, 5, "x", "y", "c", "10"),
+        ]
+        idx = TxIndexer(records)
+        result = idx.method_stats(normalize_filters())
+        self.assertEqual(
+            [g["method"] for g in result["groups"]], ["z", "b", "a", "c"]
+        )
+
+    def test_count_breaks_amount_tie(self):
+        records = [
+            rec("a1", 1, 1, "x", "y", "lo", "5"),
+            rec("b1", 2, 2, "x", "y", "hi", "5"),
+            rec("b2", 3, 3, "x", "y", "hi", "0"),
+        ]
+        idx = TxIndexer(records)
+        result = idx.method_stats(normalize_filters())
+        # 金额均为 5；hi count=2 优先
+        self.assertEqual(
+            [g["method"] for g in result["groups"]], ["hi", "lo"]
+        )
+
+    def test_filters_intersect(self):
+        result = self.idx.method_stats(
+            normalize_filters(from_address=["alice"])
+        )
+        # h1(transfer 10)、h3(transfer 20)、h5(mint 10)
+        self.assertEqual(
+            [g["method"] for g in result["groups"]], ["transfer", "mint"]
+        )
+        self.assertEqual(result["groups"][0]["total_amount"], "30")
+        self.assertEqual(result["groups"][1]["total_amount"], "10")
+
+    def test_pagination_no_skip_no_dup_no_reorder(self):
+        filters = normalize_filters()
+        expected = ["approve", "mint", "transfer"]
+        collected = []
+        cursor = None
+        pages = 0
+        while True:
+            page = self.idx.method_stats(
+                filters, page_size=2, cursor=cursor
+            )
+            pages += 1
+            self.assertEqual(page["total_groups"], 3)
+            collected.extend(g["method"] for g in page["groups"])
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(pages, 2)
+        self.assertEqual(collected, expected)
+
+    def test_page_size_one_traversal(self):
+        filters = normalize_filters()
+        collected = []
+        cursor = None
+        for _ in range(3):
+            page = self.idx.method_stats(
+                filters, page_size=1, cursor=cursor
+            )
+            collected.append(page["groups"][0]["method"])
+            cursor = page["next_cursor"]
+        self.assertIsNone(cursor)
+        self.assertEqual(collected, ["approve", "mint", "transfer"])
+
+    def test_empty_result(self):
+        result = self.idx.method_stats(normalize_filters(method="nope"))
+        self.assertEqual(result, {
+            "groups": [],
+            "total_groups": 0,
+            "next_cursor": None,
+        })
+
+    def test_cursor_filter_mismatch(self):
+        page1 = self.idx.method_stats(
+            normalize_filters(), page_size=1
+        )
+        cursor = page1["next_cursor"]
+        with self.assertRaises(InvalidCursorError):
+            self.idx.method_stats(
+                normalize_filters(method="transfer"),
+                page_size=1,
+                cursor=cursor,
+            )
+
+    def test_cursor_cross_command_rejected(self):
+        query_page = self.idx.query(normalize_filters(), page_size=1)
+        with self.assertRaises(InvalidCursorError):
+            self.idx.method_stats(
+                normalize_filters(),
+                page_size=1,
+                cursor=query_page["next_cursor"],
+            )
+        ms_page = self.idx.method_stats(normalize_filters(), page_size=1)
+        with self.assertRaises(InvalidCursorError):
+            self.idx.query(
+                normalize_filters(),
+                page_size=1,
+                cursor=ms_page["next_cursor"],
+            )
+
+    def test_cursor_garbage(self):
+        for bad in ("", "not-base64!!!", "bm9wZQ", "%%%"):
+            with self.assertRaises(InvalidCursorError):
+                self.idx.method_stats(normalize_filters(), cursor=bad)
+
+    def test_page_size_bounds(self):
+        with self.assertRaises(InvalidPageSizeError):
+            self.idx.method_stats(normalize_filters(), page_size=0)
+        with self.assertRaises(InvalidPageSizeError):
+            self.idx.method_stats(normalize_filters(), page_size=1001)
+        with self.assertRaises(InvalidPageSizeError):
+            self.idx.method_stats(normalize_filters(), page_size="10")
+
+    def test_big_amounts_exact_decimal(self):
+        big = "123456789012345678901234567890"
+        idx = TxIndexer([
+            rec("x1", 1, 1, "a", "b", "m", big),
+            rec("x2", 2, 2, "a", "b", "n", "1"),
+        ])
+        result = idx.method_stats(normalize_filters())
+        self.assertEqual(result["groups"][0]["total_amount"], big)
+        self.assertEqual(result["groups"][0]["avg_amount"], big)
+        self.assertEqual(result["groups"][1]["avg_amount"], "1")
+
+
 if __name__ == "__main__":
     unittest.main()
