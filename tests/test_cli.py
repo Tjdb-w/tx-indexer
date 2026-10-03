@@ -214,6 +214,185 @@ class CliTest(unittest.TestCase):
         self.assertEqual(payload["error"], "invalid_transaction")
         self.assertEqual(payload["input_line"], 2)
 
+    def test_address_stats(self):
+        code, page1, _ = self._run(
+            ["address-stats", self.path, "--page-size", "2"])
+        self.assertEqual(code, 0)
+        # h1 alice→bob 10、h2 bob→alice 21、h3 alice→carol 5
+        self.assertEqual(page1["total_groups"], 3)
+        self.assertEqual(page1["groups"], [
+            {"address": "alice", "send_count": 2, "receive_count": 1,
+             "total_count": 3, "total_amount": "36", "avg_amount": "12"},
+            {"address": "bob", "send_count": 1, "receive_count": 1,
+             "total_count": 2, "total_amount": "31", "avg_amount": "15"},
+        ])
+        self.assertIsNotNone(page1["next_cursor"])
+
+        code, page2, _ = self._run([
+            "address-stats", self.path, "--page-size", "2",
+            "--cursor", page1["next_cursor"],
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(page2["groups"], [
+            {"address": "carol", "send_count": 0, "receive_count": 1,
+             "total_count": 1, "total_amount": "5", "avg_amount": "5"},
+        ])
+        self.assertEqual(page2["total_groups"], 3)
+        self.assertIsNone(page2["next_cursor"])
+
+    def test_address_stats_walk_all_pages(self):
+        collected = []
+        cursor = None
+        while True:
+            argv = ["address-stats", self.path, "--page-size", "1"]
+            if cursor is not None:
+                argv += ["--cursor", cursor]
+            code, page, _ = self._run(argv)
+            self.assertEqual(code, 0)
+            collected.extend(g["address"] for g in page["groups"])
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(collected, ["alice", "bob", "carol"])
+
+    def test_address_stats_self_transfer(self):
+        path = os.path.join(self.tmp.name, "self.jsonl")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "tx_hash": "s1", "block_number": 1, "timestamp": 1,
+                "from_address": "eva", "to_address": "eva",
+                "method": "m", "amount": "100",
+            }) + "\n")
+        code, page, _ = self._run(["address-stats", path])
+        self.assertEqual(code, 0)
+        self.assertEqual(page["total_groups"], 1)
+        self.assertEqual(page["groups"], [{
+            "address": "eva",
+            "send_count": 1,
+            "receive_count": 1,
+            "total_count": 1,
+            "total_amount": "100",
+            "avg_amount": "100",
+        }])
+        self.assertIsNone(page["next_cursor"])
+
+    def test_address_stats_no_match(self):
+        code, page, _ = self._run(
+            ["address-stats", self.path, "--method", "x"])
+        self.assertEqual(code, 0)
+        self.assertEqual(page, {
+            "groups": [],
+            "total_groups": 0,
+            "next_cursor": None,
+        })
+
+    def test_address_stats_default_page_size_is_100(self):
+        code, page, _ = self._run(["address-stats", self.path])
+        self.assertEqual(code, 0)
+        self.assertEqual(page["total_groups"], 3)
+        self.assertIsNone(page["next_cursor"])
+
+    def test_address_stats_filters(self):
+        code, page, _ = self._run([
+            "address-stats", self.path,
+            "--from-address", "alice",
+            "--start-time", "15",
+        ])
+        self.assertEqual(code, 0)
+        # 仅 h3 alice→carol 5 命中
+        self.assertEqual(
+            [g["address"] for g in page["groups"]], ["alice", "carol"]
+        )
+        self.assertEqual(page["groups"][0]["total_amount"], "5")
+
+    def test_address_stats_invalid_page_size_exit_2(self):
+        code, out, err = self._run(
+            ["address-stats", self.path, "--page-size", "0"])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_page_size")
+        self.assertIsNone(payload["input_line"])
+
+    def test_address_stats_cross_command_cursor_exit_2(self):
+        for source in ("query", "method-stats"):
+            code, src_page, _ = self._run(
+                [source, self.path, "--page-size", "1"])
+            self.assertEqual(code, 0)
+            code, out, err = self._run([
+                "address-stats", self.path,
+                "--cursor", src_page["next_cursor"],
+            ])
+            self.assertEqual(code, 2)
+            self.assertIsNone(out)
+            payload = json.loads(err)
+            self.assertEqual(payload["error"], "invalid_cursor")
+            self.assertIsNone(payload["input_line"])
+
+        # 反向：address-stats 游标用于其他命令同样拒绝
+        code, addr_page, _ = self._run(
+            ["address-stats", self.path, "--page-size", "1"])
+        self.assertEqual(code, 0)
+        for target in ("query", "method-stats"):
+            code, out, err = self._run([
+                target, self.path,
+                "--cursor", addr_page["next_cursor"],
+            ])
+            self.assertEqual(code, 2)
+            self.assertEqual(
+                json.loads(err)["error"], "invalid_cursor"
+            )
+
+    def test_address_stats_cursor_bound_to_filters(self):
+        code, page1, _ = self._run([
+            "address-stats", self.path,
+            "--address", "alice", "--page-size", "1"])
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(page1["next_cursor"])
+
+        code, out, err = self._run([
+            "address-stats", self.path,
+            "--address", "bob", "--page-size", "1",
+            "--cursor", page1["next_cursor"]])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_cursor")
+        self.assertIsNone(payload["input_line"])
+
+    def test_address_stats_data_error_has_line_no(self):
+        bad = os.path.join(self.tmp.name, "bad_addr.jsonl")
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(DATA_LINES[0]) + "\n")
+            fh.write("{broken\n")
+        code, _, err = self._run(["address-stats", bad])
+        self.assertEqual(code, 2)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_transaction")
+        self.assertEqual(payload["input_line"], 2)
+
+    def test_address_stats_invalid_filter_before_file_read(self):
+        missing = os.path.join(self.tmp.name, "missing.jsonl")
+        code, out, err = self._run(
+            ["address-stats", missing,
+             "--address", "a", "--from-address", "b"])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_filter")
+        self.assertIsNone(payload["input_line"])
+
+    def test_address_stats_invalid_time_range_before_file_read(self):
+        missing = os.path.join(self.tmp.name, "missing.jsonl")
+        code, out, err = self._run(
+            ["address-stats", missing,
+             "--start-time", "100", "--end-time", "1"])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_time_range")
+        self.assertIsNone(payload["input_line"])
+
     def test_invalid_page_size_exit_2(self):
         code, out, err = self._run(
             ["query", self.path, "--page-size", "5000"])

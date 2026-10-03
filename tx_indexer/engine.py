@@ -9,6 +9,8 @@
 
 query 排序：block_number 升序，同高度按 tx_hash 升序。
 method-stats 排序：total_amount 降序、total_count 降序、method 码点升序。
+address-stats 排序：total_amount 降序、total_count 降序、send_count 降序、
+receive_count 降序、address 码点升序。
 分页：不透明 keyset 游标（见 :mod:`tx_indexer.cursor`），相同命令与
 筛选下不跳过、不重复、不乱序；``total`` / ``total_groups`` 始终为
 全部匹配数 / 全部分组数。
@@ -17,8 +19,10 @@ method-stats 排序：total_amount 降序、total_count 降序、method 码点�
 import bisect
 
 from .cursor import (
+    decode_address_stats_cursor,
     decode_cursor,
     decode_method_stats_cursor,
+    encode_address_stats_cursor,
     encode_cursor,
     encode_method_stats_cursor,
 )
@@ -284,6 +288,126 @@ class TxIndexer:
             last = page_methods[-1]
             next_cursor = encode_method_stats_cursor(
                 filters, totals[last], counts[last], last
+            )
+        else:
+            next_cursor = None
+
+        return {
+            "groups": groups,
+            "total_groups": total_groups,
+            "next_cursor": next_cursor,
+        }
+
+    def address_stats(self, filters, page_size=DEFAULT_PAGE_SIZE, cursor=None):
+        """按参与地址分组的分页统计。
+
+        每条匹配交易以 from_address、to_address 的原字符串分别记一次
+        发送、接收参与；自转账（from == to）的 total_count 只计一次，
+        send_count / receive_count 各加一，金额只累计一次。
+
+        返回 {groups, total_groups, next_cursor}；每组含 address、
+        send_count、receive_count、total_count、total_amount、avg_amount
+        （金额为十进制整数字符串，平均值向下取整）。顺序：total_amount
+        降序、total_count 降序、send_count 降序、receive_count 降序、
+        address 的 Unicode 码点升序。
+        """
+        self._validate_page_size(page_size)
+
+        totals = {}
+        send_counts = {}
+        receive_counts = {}
+        total_counts = {}
+        for record in self._records:
+            if not _matches(record, filters):
+                continue
+            value = int(record["amount"])
+            frm = record["from_address"]
+            to = record["to_address"]
+
+            totals[frm] = totals.get(frm, 0) + value
+            send_counts[frm] = send_counts.get(frm, 0) + 1
+            total_counts[frm] = total_counts.get(frm, 0) + 1
+            receive_counts.setdefault(frm, 0)
+
+            if to == frm:
+                # 自转账：total_count 不重复计、金额不重复累计，
+                # 但发送、接收两个身份各加一
+                receive_counts[to] += 1
+            else:
+                totals[to] = totals.get(to, 0) + value
+                receive_counts[to] = receive_counts.get(to, 0) + 1
+                total_counts[to] = total_counts.get(to, 0) + 1
+                send_counts.setdefault(to, 0)
+
+        # (-total, -total_count, -send, -receive, address) 升序即各数值
+        # 降序、address 升序，同时得到可直接 bisect 的单调递增键
+        addresses = sorted(
+            totals,
+            key=lambda a: (
+                -totals[a],
+                -total_counts[a],
+                -send_counts[a],
+                -receive_counts[a],
+                a,
+            ),
+        )
+        total_groups = len(addresses)
+
+        start = 0
+        if cursor is not None:
+            (
+                after_total,
+                after_total_count,
+                after_send,
+                after_receive,
+                after_address,
+            ) = decode_address_stats_cursor(cursor, filters)
+            keys = [
+                (
+                    -totals[a],
+                    -total_counts[a],
+                    -send_counts[a],
+                    -receive_counts[a],
+                    a,
+                )
+                for a in addresses
+            ]
+            marker = (
+                -after_total,
+                -after_total_count,
+                -after_send,
+                -after_receive,
+                after_address,
+            )
+            # keyset 续页：排序键严格大于 marker 的第一个位置。
+            # marker 位于两键之间也安全（bisect 取下一键），不会跳过或重复。
+            start = bisect.bisect_left(keys, marker)
+            if start < total_groups and keys[start] == marker:
+                # marker 命中现存分组本身：从其后一组开始
+                start += 1
+
+        end = start + page_size
+        page_addresses = addresses[start:end]
+        groups = [
+            {
+                "address": address,
+                "send_count": send_counts[address],
+                "receive_count": receive_counts[address],
+                "total_count": total_counts[address],
+                "total_amount": str(totals[address]),
+                "avg_amount": str(totals[address] // total_counts[address]),
+            }
+            for address in page_addresses
+        ]
+        if end < total_groups:
+            last = page_addresses[-1]
+            next_cursor = encode_address_stats_cursor(
+                filters,
+                totals[last],
+                total_counts[last],
+                send_counts[last],
+                receive_counts[last],
+                last,
             )
         else:
             next_cursor = None

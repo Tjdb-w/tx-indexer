@@ -1,9 +1,11 @@
-"""命令行入口：``tx-indexer query`` / ``stats`` / ``method-stats``。
+"""命令行入口：``tx-indexer query`` / ``stats`` / ``method-stats`` /
+``address-stats``。
 
 用法：
     tx-indexer query <data.jsonl> [筛选与分页选项]
     tx-indexer stats <data.jsonl> [筛选选项]
     tx-indexer method-stats <data.jsonl> [筛选与分页选项]
+    tx-indexer address-stats <data.jsonl> [筛选与分页选项]
 
 领域错误（invalid_transaction / duplicate_transaction / invalid_time_range /
 invalid_page_size / invalid_cursor / invalid_filter）以 JSON 对象输出到
@@ -106,6 +108,21 @@ def build_parser():
         "--cursor", help="上一页返回的 next_cursor"
     )
 
+    address_stats_parser = subparsers.add_parser(
+        "address-stats",
+        help="按参与地址分页汇总（返回 groups/total_groups/next_cursor）",
+    )
+    address_stats_parser.add_argument("file", help="JSON Lines 数据文件路径")
+    _add_filter_args(address_stats_parser)
+    address_stats_parser.add_argument(
+        "--page-size",
+        default=str(DEFAULT_PAGE_SIZE),
+        help="每页分组数，1 到 1000，默认 100",
+    )
+    address_stats_parser.add_argument(
+        "--cursor", help="上一页返回的 next_cursor"
+    )
+
     return parser
 
 
@@ -140,7 +157,7 @@ def main(argv=None):
     try:
         filters = _filters_from_args(args, parser)
         page_size = None
-        if args.command in ("query", "method-stats"):
+        if args.command in ("query", "method-stats", "address-stats"):
             page_size = _parse_page_size(args.page_size)
 
         records = load_file(args.file)
@@ -152,6 +169,10 @@ def main(argv=None):
             )
         elif args.command == "method-stats":
             result = indexer.method_stats(
+                filters, page_size=page_size, cursor=args.cursor
+            )
+        elif args.command == "address-stats":
+            result = indexer.address_stats(
                 filters, page_size=page_size, cursor=args.cursor
             )
         else:
