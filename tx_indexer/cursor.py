@@ -24,6 +24,7 @@ _CURSOR_VERSION = 1
 SCOPE_QUERY = "query"
 SCOPE_METHOD_STATS = "method-stats"
 SCOPE_ADDRESS_STATS = "address-stats"
+SCOPE_COUNTERPARTY_STATS = "counterparty-stats"
 
 
 def _as_sorted_list(value):
@@ -165,19 +166,10 @@ def decode_method_stats_cursor(token, filters):
 def encode_address_stats_cursor(filters, after_total_amount, after_total_count,
                                 after_send_count, after_receive_count,
                                 after_address):
-    payload = {
-        "v": _CURSOR_VERSION,
-        "c": SCOPE_ADDRESS_STATS,
-        "f": _canonical_filters(filters),
-        "after": [
-            after_total_amount,
-            after_total_count,
-            after_send_count,
-            after_receive_count,
-            after_address,
-        ],
-    }
-    return _encode_payload(payload)
+    return _encode_stats_cursor(
+        SCOPE_ADDRESS_STATS, filters, after_total_amount, after_total_count,
+        after_send_count, after_receive_count, after_address,
+    )
 
 
 def decode_address_stats_cursor(token, filters):
@@ -186,7 +178,50 @@ def decode_address_stats_cursor(token, filters):
     返回 exclusive marker ``(total_amount, total_count, send_count,
     receive_count, address)``。
     """
-    payload = _decode_payload(token, filters, SCOPE_ADDRESS_STATS)
+    return _decode_stats_cursor(token, filters, SCOPE_ADDRESS_STATS)
+
+
+def encode_counterparty_stats_cursor(filters, after_total_amount,
+                                     after_total_count, after_send_count,
+                                     after_receive_count, after_counterparty):
+    return _encode_stats_cursor(
+        SCOPE_COUNTERPARTY_STATS, filters, after_total_amount,
+        after_total_count, after_send_count, after_receive_count,
+        after_counterparty,
+    )
+
+
+def decode_counterparty_stats_cursor(token, filters):
+    """解码并校验 counterparty-stats 游标。
+
+    返回 exclusive marker ``(total_amount, total_count, send_count,
+    receive_count, counterparty)``。
+    """
+    return _decode_stats_cursor(token, filters, SCOPE_COUNTERPARTY_STATS)
+
+
+def _encode_stats_cursor(scope, filters, after_total_amount,
+                         after_total_count, after_send_count,
+                         after_receive_count, after_key):
+    """address-stats / counterparty-stats 共用的五元组排序键游标编码。"""
+    payload = {
+        "v": _CURSOR_VERSION,
+        "c": scope,
+        "f": _canonical_filters(filters),
+        "after": [
+            after_total_amount,
+            after_total_count,
+            after_send_count,
+            after_receive_count,
+            after_key,
+        ],
+    }
+    return _encode_payload(payload)
+
+
+def _decode_stats_cursor(token, filters, expected_scope):
+    """五元组排序键游标的通用解码（末位为地址或对手字符串键）。"""
+    payload = _decode_payload(token, filters, expected_scope)
 
     after = payload.get("after")
     if (

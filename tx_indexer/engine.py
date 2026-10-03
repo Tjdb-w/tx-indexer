@@ -11,6 +11,9 @@ query 排序：block_number 升序，同高度按 tx_hash 升序。
 method-stats 排序：total_amount 降序、total_count 降序、method 码点升序。
 address-stats 排序：total_amount 降序、total_count 降序、send_count 降序、
 receive_count 降序、address 码点升序。
+counterparty-stats 排序键与 address-stats 相同，末级改为 counterparty
+码点升序；每笔匹配交易只归入一个对手（发送方为观察地址时归
+to_address，接收方为观察地址时归 from_address，自转账归观察地址本身）。
 分页：不透明 keyset 游标（见 :mod:`tx_indexer.cursor`），相同命令与
 筛选下不跳过、不重复、不乱序；``total`` / ``total_groups`` 始终为
 全部匹配数 / 全部分组数。
@@ -20,9 +23,11 @@ import bisect
 
 from .cursor import (
     decode_address_stats_cursor,
+    decode_counterparty_stats_cursor,
     decode_cursor,
     decode_method_stats_cursor,
     encode_address_stats_cursor,
+    encode_counterparty_stats_cursor,
     encode_cursor,
     encode_method_stats_cursor,
 )
@@ -413,6 +418,151 @@ class TxIndexer:
             next_cursor = None
 
         return {
+            "groups": groups,
+            "total_groups": total_groups,
+            "next_cursor": next_cursor,
+        }
+
+    def counterparty_stats(self, filters, page_size=DEFAULT_PAGE_SIZE,
+                           cursor=None):
+        """按交易对手分页汇总（必须给定 address 筛选作为观察地址）。
+
+        只统计发送方或接收方为观察地址的匹配交易，且每笔交易只归一个
+        对手：发送方为观察地址时归入 to_address，接收方为观察地址时归
+        入 from_address；自转账以观察地址自身为对手，total_count 只计
+        一次、send_count / receive_count 各加一、金额只累计一次。
+        各分组的 send_count / receive_count / total_count / 金额口径与
+        address-stats 相同（从对手视角计发送/接收）。
+
+        返回 {address, groups, total_groups, next_cursor}；每组含
+        counterparty、send_count、receive_count、total_count、
+        total_amount、avg_amount（金额为十进制整数字符串，平均值向下
+        取整）。顺序：total_amount 降序、total_count 降序、send_count
+        降序、receive_count 降序、counterparty 的 Unicode 码点升序。
+        """
+        self._validate_page_size(page_size)
+        address = filters["address"]
+        if address is None:
+            raise InvalidFilterError(
+                "counterparty-stats 必须给定 address 筛选", None
+            )
+
+        totals = {}
+        send_counts = {}
+        receive_counts = {}
+        total_counts = {}
+        for record in self._records:
+            if not _matches(record, filters):
+                continue
+            value = int(record["amount"])
+            frm = record["from_address"]
+            to = record["to_address"]
+
+            if frm == to:
+                # 自转账：对手即观察地址本身，两个身份各加一，
+                # total_count 与金额只计一次
+                counterparty = frm
+                send_counts[counterparty] = (
+                    send_counts.get(counterparty, 0) + 1
+                )
+                receive_counts[counterparty] = (
+                    receive_counts.get(counterparty, 0) + 1
+                )
+            elif frm == address:
+                # 观察地址发出：对手为接收方，记一次接收
+                counterparty = to
+                send_counts.setdefault(counterparty, 0)
+                receive_counts[counterparty] = (
+                    receive_counts.get(counterparty, 0) + 1
+                )
+            else:
+                # 观察地址接收：对手为发送方，记一次发送
+                counterparty = frm
+                send_counts[counterparty] = (
+                    send_counts.get(counterparty, 0) + 1
+                )
+                receive_counts.setdefault(counterparty, 0)
+
+            totals[counterparty] = totals.get(counterparty, 0) + value
+            total_counts[counterparty] = total_counts.get(counterparty, 0) + 1
+
+        # (-total, -total_count, -send, -receive, counterparty) 升序即各
+        # 数值降序、counterparty 升序，同时得到可直接 bisect 的单调递增键
+        counterparties = sorted(
+            totals,
+            key=lambda c: (
+                -totals[c],
+                -total_counts[c],
+                -send_counts[c],
+                -receive_counts[c],
+                c,
+            ),
+        )
+        total_groups = len(counterparties)
+
+        start = 0
+        if cursor is not None:
+            (
+                after_total,
+                after_total_count,
+                after_send,
+                after_receive,
+                after_counterparty,
+            ) = decode_counterparty_stats_cursor(cursor, filters)
+            keys = [
+                (
+                    -totals[c],
+                    -total_counts[c],
+                    -send_counts[c],
+                    -receive_counts[c],
+                    c,
+                )
+                for c in counterparties
+            ]
+            marker = (
+                -after_total,
+                -after_total_count,
+                -after_send,
+                -after_receive,
+                after_counterparty,
+            )
+            # keyset 续页：排序键严格大于 marker 的第一个位置。
+            # marker 位于两键之间也安全（bisect 取下一键），不会跳过或重复。
+            start = bisect.bisect_left(keys, marker)
+            if start < total_groups and keys[start] == marker:
+                # marker 命中现存分组本身：从其后一组开始
+                start += 1
+
+        end = start + page_size
+        page_counterparties = counterparties[start:end]
+        groups = [
+            {
+                "counterparty": counterparty,
+                "send_count": send_counts[counterparty],
+                "receive_count": receive_counts[counterparty],
+                "total_count": total_counts[counterparty],
+                "total_amount": str(totals[counterparty]),
+                "avg_amount": str(
+                    totals[counterparty] // total_counts[counterparty]
+                ),
+            }
+            for counterparty in page_counterparties
+        ]
+        if end < total_groups:
+            last = page_counterparties[-1]
+            next_cursor = encode_counterparty_stats_cursor(
+                filters,
+                totals[last],
+                total_counts[last],
+                send_counts[last],
+                receive_counts[last],
+                last,
+            )
+        else:
+            next_cursor = None
+
+        return {
+            "address": address,
             "groups": groups,
             "total_groups": total_groups,
             "next_cursor": next_cursor,
