@@ -27,6 +27,7 @@
 ```bash
 ./tx-indexer query <data.jsonl> [选项]
 ./tx-indexer stats <data.jsonl> [选项]
+./tx-indexer method-stats <data.jsonl> [选项]
 ```
 
 也可以用 `python3 -m tx_indexer ...`。
@@ -41,7 +42,7 @@
 
 集合类选项（`--from-address` / `--to-address` / `--method`）重复给定相同值等同一个条件。筛选值为空或仅含空白、或 `--address` 与付款方/收款方筛选并用，会在读取数据文件前报 `invalid_filter`。
 
-`query` 额外选项：
+`query` 与 `method-stats` 额外选项：
 
 - `--page-size N`：每页条数，默认 `100`，范围 1..1000
 - `--cursor TOKEN`：上一页返回的 `next_cursor`
@@ -77,6 +78,25 @@
 
 无匹配时：`total_count` 为 `0`、`total_amount` 为 `"0"`，其余三项为 `null`。
 
+### method-stats 返回
+
+把匹配交易按 `method` 精确字符串值分组，金额为十进制整数字符串，`avg_amount` 向下取整。分组按 `total_amount` 数值降序、`total_count` 降序、`method` 的 Unicode 码点升序确定唯一顺序：
+
+```json
+{
+  "groups": [
+    {"method": "approve", "total_count": 1, "total_amount": "21", "avg_amount": "21"},
+    {"method": "transfer", "total_count": 2, "total_amount": "15", "avg_amount": "7"}
+  ],
+  "total_groups": 2,
+  "next_cursor": null
+}
+```
+
+- `total_groups` 为全部分组数（不是当前页分组数）。
+- 末页 `next_cursor` 为 `null`。游标不透明且自校验，只允许在相同命令及等价筛选条件下续用；跨命令复用（如把 query 游标用于 method-stats）或改变筛选条件都会报 `invalid_cursor`。
+- 无匹配时：`groups` 为 `[]`、`total_groups` 为 `0`、`next_cursor` 为 `null`。
+
 ## 错误处理
 
 领域错误输出到 stderr（单行 JSON，含 `error`、`message`、`input_line`），退出码为 `2`。只有输入数据行错误才带 1 起始行号，其余错误 `input_line` 为 `null`。
@@ -101,4 +121,4 @@
 
 ## 状态
 
-已实现：公开查询、游标分页、聚合统计与六类异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选。
+已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）与六类异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选。

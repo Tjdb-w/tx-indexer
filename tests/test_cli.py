@@ -87,6 +87,133 @@ class CliTest(unittest.TestCase):
         self.assertEqual(stats["total_amount"], "0")
         self.assertIsNone(stats["min_amount"])
 
+    def test_method_stats(self):
+        code, page1, _ = self._run(
+            ["method-stats", self.path, "--page-size", "1"])
+        self.assertEqual(code, 0)
+        self.assertEqual(page1["total_groups"], 2)
+        self.assertEqual(page1["groups"], [{
+            "method": "approve",
+            "total_count": 1,
+            "total_amount": "21",
+            "avg_amount": "21",
+        }])
+        self.assertIsNotNone(page1["next_cursor"])
+
+        code, page2, _ = self._run([
+            "method-stats", self.path, "--page-size", "1",
+            "--cursor", page1["next_cursor"],
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(page2["groups"], [{
+            "method": "transfer",
+            "total_count": 2,
+            "total_amount": "15",
+            "avg_amount": "7",
+        }])
+        self.assertEqual(page2["total_groups"], 2)
+        self.assertIsNone(page2["next_cursor"])
+
+    def test_method_stats_walk_all_pages(self):
+        collected = []
+        cursor = None
+        while True:
+            argv = ["method-stats", self.path, "--page-size", "1"]
+            if cursor is not None:
+                argv += ["--cursor", cursor]
+            code, page, _ = self._run(argv)
+            self.assertEqual(code, 0)
+            collected.extend(g["method"] for g in page["groups"])
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(collected, ["approve", "transfer"])
+
+    def test_method_stats_no_match(self):
+        code, page, _ = self._run(
+            ["method-stats", self.path, "--method", "x"])
+        self.assertEqual(code, 0)
+        self.assertEqual(page, {
+            "groups": [],
+            "total_groups": 0,
+            "next_cursor": None,
+        })
+
+    def test_method_stats_filters(self):
+        code, page, _ = self._run([
+            "method-stats", self.path,
+            "--from-address", "alice",
+            "--start-time", "15",
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [g["method"] for g in page["groups"]], ["transfer"]
+        )
+        self.assertEqual(page["groups"][0]["total_count"], 1)
+        self.assertEqual(page["groups"][0]["total_amount"], "5")
+
+    def test_method_stats_invalid_page_size_exit_2(self):
+        code, out, err = self._run(
+            ["method-stats", self.path, "--page-size", "5000"])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_page_size")
+        self.assertIsNone(payload["input_line"])
+
+    def test_method_stats_cross_command_cursor_exit_2(self):
+        code, query_page, _ = self._run(
+            ["query", self.path, "--page-size", "1"])
+        self.assertEqual(code, 0)
+        code, out, err = self._run([
+            "method-stats", self.path,
+            "--cursor", query_page["next_cursor"],
+        ])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_cursor")
+        self.assertIsNone(payload["input_line"])
+
+        code, method_page, _ = self._run(
+            ["method-stats", self.path, "--page-size", "1"])
+        self.assertEqual(code, 0)
+        code, out, err = self._run([
+            "query", self.path, "--cursor", method_page["next_cursor"],
+        ])
+        self.assertEqual(code, 2)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_cursor")
+
+    def test_method_stats_cursor_bound_to_filters(self):
+        code, page1, _ = self._run([
+            "method-stats", self.path,
+            "--address", "alice", "--page-size", "1"])
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(page1["next_cursor"])
+
+        # 改变筛选复用旧游标 → invalid_cursor
+        code, out, err = self._run([
+            "method-stats", self.path,
+            "--address", "bob", "--page-size", "1",
+            "--cursor", page1["next_cursor"]])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_cursor")
+        self.assertIsNone(payload["input_line"])
+
+    def test_method_stats_data_error_has_line_no(self):
+        bad = os.path.join(self.tmp.name, "bad.jsonl")
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(DATA_LINES[0]) + "\n")
+            fh.write("{broken\n")
+        code, _, err = self._run(["method-stats", bad])
+        self.assertEqual(code, 2)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_transaction")
+        self.assertEqual(payload["input_line"], 2)
+
     def test_invalid_page_size_exit_2(self):
         code, out, err = self._run(
             ["query", self.path, "--page-size", "5000"])

@@ -7,14 +7,21 @@
   任一命中即可；可重复给定，重复值等同一个条件
 - ``start_time`` / ``end_time``：时间窗，左闭右闭（UTC 秒）
 
-排序：block_number 升序，同高度按 tx_hash 升序。
-分页：不透明 keyset 游标（见 :mod:`tx_indexer.cursor`），相同筛选下
-不跳过、不重复、不乱序；``total`` 始终为全部匹配数。
+query 排序：block_number 升序，同高度按 tx_hash 升序。
+method-stats 排序：total_amount 降序、total_count 降序、method 码点升序。
+分页：不透明 keyset 游标（见 :mod:`tx_indexer.cursor`），相同命令与
+筛选下不跳过、不重复、不乱序；``total`` / ``total_groups`` 始终为
+全部匹配数 / 全部分组数。
 """
 
 import bisect
 
-from .cursor import decode_cursor, encode_cursor
+from .cursor import (
+    decode_cursor,
+    decode_method_stats_cursor,
+    encode_cursor,
+    encode_method_stats_cursor,
+)
 from .errors import (
     InvalidFilterError,
     InvalidPageSizeError,
@@ -218,4 +225,71 @@ class TxIndexer:
             "min_amount": str(min_amount),
             "max_amount": str(max_amount),
             "avg_amount": str(total_amount // count),
+        }
+
+    def method_stats(self, filters, page_size=DEFAULT_PAGE_SIZE, cursor=None):
+        """按 method 分组的分页统计。
+
+        返回 {groups, total_groups, next_cursor}；每组含 method、
+        total_count、total_amount、avg_amount（金额为十进制整数字符串，
+        平均值向下取整）。顺序：total_amount 降序、total_count 降序、
+        method 的 Unicode 码点升序。
+        """
+        self._validate_page_size(page_size)
+
+        totals = {}
+        counts = {}
+        for record in self._records:
+            if not _matches(record, filters):
+                continue
+            method = record["method"]
+            totals[method] = totals.get(method, 0) + int(record["amount"])
+            counts[method] = counts.get(method, 0) + 1
+
+        # (-total, -count, method) 升序即 total/count 降序、method 升序，
+        # 同时得到可直接 bisect 的单调递增键
+        methods = sorted(
+            totals, key=lambda m: (-totals[m], -counts[m], m)
+        )
+        total_groups = len(methods)
+
+        start = 0
+        if cursor is not None:
+            (
+                after_total,
+                after_count,
+                after_method,
+            ) = decode_method_stats_cursor(cursor, filters)
+            keys = [(-totals[m], -counts[m], m) for m in methods]
+            marker = (-after_total, -after_count, after_method)
+            # keyset 续页：排序键严格大于 marker 的第一个位置。
+            # marker 位于两键之间也安全（bisect 取下一键），不会跳过或重复。
+            start = bisect.bisect_left(keys, marker)
+            if start < total_groups and keys[start] == marker:
+                # marker 命中现存分组本身：从其后一组开始
+                start += 1
+
+        end = start + page_size
+        page_methods = methods[start:end]
+        groups = [
+            {
+                "method": method,
+                "total_count": counts[method],
+                "total_amount": str(totals[method]),
+                "avg_amount": str(totals[method] // counts[method]),
+            }
+            for method in page_methods
+        ]
+        if end < total_groups:
+            last = page_methods[-1]
+            next_cursor = encode_method_stats_cursor(
+                filters, totals[last], counts[last], last
+            )
+        else:
+            next_cursor = None
+
+        return {
+            "groups": groups,
+            "total_groups": total_groups,
+            "next_cursor": next_cursor,
         }
