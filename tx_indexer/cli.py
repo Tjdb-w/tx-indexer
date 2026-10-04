@@ -1,6 +1,6 @@
 """命令行入口：``tx-indexer query`` / ``stats`` / ``method-stats`` /
 ``address-stats`` / ``counterparty-stats`` / ``time-stats`` /
-``pair-stats``。
+``pair-stats`` / ``address-time-stats``。
 
 用法：
     tx-indexer query <data.jsonl> [筛选与分页选项]
@@ -10,6 +10,7 @@
     tx-indexer counterparty-stats <data.jsonl> --address ADDR [筛选与分页选项]
     tx-indexer time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
     tx-indexer pair-stats <data.jsonl> [筛选与分页选项]
+    tx-indexer address-time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
 
 领域错误（invalid_transaction / duplicate_transaction / invalid_time_range /
 invalid_page_size / invalid_cursor / invalid_filter / invalid_bucket_size）
@@ -81,7 +82,7 @@ def _parse_bucket_size(value):
     """解析 --bucket-size；缺失、非整数或不大于 0 都报 invalid_bucket_size。"""
     if value is None:
         raise InvalidBucketSizeError(
-            "time-stats 必须指定 --bucket-size（秒）", None
+            "必须指定 --bucket-size（秒）", None
         )
     try:
         parsed = int(value)
@@ -200,6 +201,27 @@ def build_parser():
         "--cursor", help="上一页返回的 next_cursor"
     )
 
+    address_time_stats_parser = subparsers.add_parser(
+        "address-time-stats",
+        help="按（地址, 时间区间）分页汇总（返回 groups/total_groups/next_cursor）",
+    )
+    address_time_stats_parser.add_argument(
+        "file", help="JSON Lines 数据文件路径"
+    )
+    _add_filter_args(address_time_stats_parser)
+    address_time_stats_parser.add_argument(
+        "--bucket-size",
+        help="区间宽度（秒），大于 0 的整数；区间从 Unix 纪元对齐、左闭右开",
+    )
+    address_time_stats_parser.add_argument(
+        "--page-size",
+        default=str(DEFAULT_PAGE_SIZE),
+        help="每页分组数，1 到 1000，默认 100",
+    )
+    address_time_stats_parser.add_argument(
+        "--cursor", help="上一页返回的 next_cursor"
+    )
+
     return parser
 
 
@@ -241,10 +263,11 @@ def main(argv=None):
             "counterparty-stats",
             "time-stats",
             "pair-stats",
+            "address-time-stats",
         ):
             page_size = _parse_page_size(args.page_size)
         bucket_size = None
-        if args.command == "time-stats":
+        if args.command in ("time-stats", "address-time-stats"):
             # 缺失、非整数或不大于 0 都在读取数据文件前报 invalid_bucket_size
             bucket_size = _parse_bucket_size(args.bucket_size)
         if args.command == "counterparty-stats" and filters["address"] is None:
@@ -280,6 +303,10 @@ def main(argv=None):
         elif args.command == "pair-stats":
             result = indexer.pair_stats(
                 filters, page_size=page_size, cursor=args.cursor
+            )
+        elif args.command == "address-time-stats":
+            result = indexer.address_time_stats(
+                filters, bucket_size, page_size=page_size, cursor=args.cursor
             )
         else:
             result = indexer.stats(filters)

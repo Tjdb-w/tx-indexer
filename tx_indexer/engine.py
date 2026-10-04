@@ -19,6 +19,10 @@ time-stats 把匹配交易按从 Unix 纪元对齐、左闭右开的固定宽度
 pair-stats 把匹配交易按 from_address 到 to_address 的原字符串有向
 组合分组（自转账也累计一次），顺序为 total_amount 降序、total_count
 降序、from_address 码点升序、to_address 码点升序。
+address-time-stats 把匹配交易按（地址, 固定宽度时间区间）分组，
+区间对齐与 time-stats 相同；顺序为 bucket_start 升序、total_amount
+降序、total_count 降序、send_count 降序、receive_count 降序、
+address 码点升序。
 分页：不透明 keyset 游标（见 :mod:`tx_indexer.cursor`），相同命令与
 筛选下不跳过、不重复、不乱序；``total`` / ``total_groups`` 始终为
 全部匹配数 / 全部分组数。
@@ -28,12 +32,14 @@ import bisect
 
 from .cursor import (
     decode_address_stats_cursor,
+    decode_address_time_stats_cursor,
     decode_counterparty_stats_cursor,
     decode_cursor,
     decode_method_stats_cursor,
     decode_pair_stats_cursor,
     decode_time_stats_cursor,
     encode_address_stats_cursor,
+    encode_address_time_stats_cursor,
     encode_counterparty_stats_cursor,
     encode_cursor,
     encode_method_stats_cursor,
@@ -723,6 +729,137 @@ class TxIndexer:
                 counts[page_pairs[-1]],
                 last_from,
                 last_to,
+            )
+        else:
+            next_cursor = None
+
+        return {
+            "groups": groups,
+            "total_groups": total_groups,
+            "next_cursor": next_cursor,
+        }
+
+    def address_time_stats(self, filters, bucket_size,
+                           page_size=DEFAULT_PAGE_SIZE, cursor=None):
+        """按（地址, 固定宽度时间区间）分组的分页统计。
+
+        区间对齐与 time-stats 相同：``bucket_start = (timestamp //
+        bucket_size) * bucket_size``，``bucket_end_exclusive =
+        bucket_start + bucket_size``，左闭右开。每条匹配交易按
+        from_address、to_address 分别记入对应地址在该区间的分组：
+        from 与 to 不同时，发送方组 send_count 加 1、接收方组
+        receive_count 加 1，两组 total_count 各加 1 并各自累计金额；
+        自转账只进一个组，send_count / receive_count / total_count
+        各加 1，金额只累计一次。
+
+        返回 {groups, total_groups, next_cursor}；每组含 address、
+        bucket_start、bucket_end_exclusive、send_count、receive_count、
+        total_count、total_amount、avg_amount（金额为十进制整数字符串，
+        平均值向下取整）。顺序：bucket_start 升序、total_amount 降序、
+        total_count 降序、send_count 降序、receive_count 降序、
+        address 的 Unicode 码点升序。游标绑定本命令、等价筛选与
+        bucket_size，不绑定 page_size。
+        """
+        self._validate_page_size(page_size)
+        self._validate_bucket_size(bucket_size)
+
+        totals = {}
+        send_counts = {}
+        receive_counts = {}
+        total_counts = {}
+        for record in self._records:
+            if not _matches(record, filters):
+                continue
+            value = int(record["amount"])
+            frm = record["from_address"]
+            to = record["to_address"]
+            bucket_start = (record["timestamp"] // bucket_size) * bucket_size
+
+            frm_key = (bucket_start, frm)
+            totals[frm_key] = totals.get(frm_key, 0) + value
+            send_counts[frm_key] = send_counts.get(frm_key, 0) + 1
+            total_counts[frm_key] = total_counts.get(frm_key, 0) + 1
+            receive_counts.setdefault(frm_key, 0)
+
+            if to == frm:
+                # 自转账：只进一个组，total_count 与金额不重复计，
+                # 但发送、接收两个身份各加一
+                receive_counts[frm_key] += 1
+            else:
+                to_key = (bucket_start, to)
+                totals[to_key] = totals.get(to_key, 0) + value
+                receive_counts[to_key] = receive_counts.get(to_key, 0) + 1
+                total_counts[to_key] = total_counts.get(to_key, 0) + 1
+                send_counts.setdefault(to_key, 0)
+
+        # (bucket_start, -total, -total_count, -send, -receive, address)
+        # 升序即 bucket_start 升序、各数值降序、address 升序，
+        # 同时得到可直接 bisect 的单调递增键
+        def _sort_key(key):
+            return (
+                key[0],
+                -totals[key],
+                -total_counts[key],
+                -send_counts[key],
+                -receive_counts[key],
+                key[1],
+            )
+
+        group_keys = sorted(totals, key=_sort_key)
+        total_groups = len(group_keys)
+
+        start = 0
+        if cursor is not None:
+            (
+                after_bucket_start,
+                after_total,
+                after_total_count,
+                after_send,
+                after_receive,
+                after_address,
+            ) = decode_address_time_stats_cursor(cursor, filters, bucket_size)
+            keys = [_sort_key(key) for key in group_keys]
+            marker = (
+                after_bucket_start,
+                -after_total,
+                -after_total_count,
+                -after_send,
+                -after_receive,
+                after_address,
+            )
+            # keyset 续页：排序键严格大于 marker 的第一个位置。
+            # marker 位于两键之间也安全（bisect 取下一键），不会跳过或重复。
+            start = bisect.bisect_left(keys, marker)
+            if start < total_groups and keys[start] == marker:
+                # marker 命中现存分组本身：从其后一组开始
+                start += 1
+
+        end = start + page_size
+        page_keys = group_keys[start:end]
+        groups = [
+            {
+                "address": key[1],
+                "bucket_start": key[0],
+                "bucket_end_exclusive": key[0] + bucket_size,
+                "send_count": send_counts[key],
+                "receive_count": receive_counts[key],
+                "total_count": total_counts[key],
+                "total_amount": str(totals[key]),
+                "avg_amount": str(totals[key] // total_counts[key]),
+            }
+            for key in page_keys
+        ]
+        if end < total_groups:
+            last = page_keys[-1]
+            next_cursor = encode_address_time_stats_cursor(
+                filters,
+                bucket_size,
+                last[0],
+                totals[last],
+                total_counts[last],
+                send_counts[last],
+                receive_counts[last],
+                last[1],
             )
         else:
             next_cursor = None
