@@ -65,3 +65,15 @@ class InvalidBucketSizeError(TxIndexerError):
     """bucket_size 缺失、无法解析为整数或不大于 0。"""
 
     error = "invalid_bucket_size"
+
+
+class SourceUnavailableError(TxIndexerError):
+    """上游暂时无法返回指定区块；已提交批次与水位保持有效。"""
+
+    error = "source_unavailable"
+
+
+class TransactionConflictError(TxIndexerError):
+    """相同 tx_hash 再次出现但标准化内容（区块、时间、地址、方法）不一致。"""
+
+    error = "transaction_conflict"

@@ -314,6 +314,121 @@ result = importer.replace_from(
 | `IMPORT_CURSOR_MISMATCH` | `start_block` 不是已导入高度；游标缺失/非法/不是当前导入游标，或误用了分页游标；替换批次 `chain_id` 与已导入链不同 |
 | `TX_CONFLICT` | 新后缀交易与保留前缀或新后缀内部同名交易的决定字段不一致 |
 
+## 索引水位与幂等重放
+
+`tx_indexer.replay.ReplayManager` 是一个独立可用的索引水位与幂等重放
+入口，与现有查询、聚合统计和分页游标共享同一份内存索引：按链维护已
+提交水位，让同一段链上历史可以被安全地重复提交，也能在网络中断后从
+确定位置继续。处理顺序固定为从起始区块升序到结束区块，每个批次先
+校验并标准化交易，再把交易写入现有索引，最后推进该链的已提交水位。
+
+```python
+from tx_indexer.replay import ReplayManager
+
+def fetch_blocks(start_block, end_block):
+    # 闭区间拉取；返回区块列表，顺序任意（按 block_number 归位）。
+    # 暂时无法返回指定区块时抛 SourceUnavailableError。
+    return [
+        {"block_number": h, "transactions": [...]}
+        for h in range(start_block, end_block + 1)
+    ]
+
+manager = ReplayManager(fetch_blocks)
+result = manager.submit("chain-a", 0, 99, batch_size=10)
+status = manager.status("chain-a")
+indexer = manager.indexer             # 底层 TxIndexer，提交成功后立即可查
+```
+
+上游交易至少包含 `tx_hash`、`block_number`、`timestamp`、
+`from_address`、`to_address`、`method`、`amount`（字段规则与数据文件
+相同：`amount` 为非负十进制整数字符串；未定义的额外字段被忽略）。
+`block_number` 必须等于交易所在区块的高度。标准化结果保留交易哈希、
+区块高度、区块时间、发起地址、接收地址和方法标识（`amount` 作为
+查询字段一并透传），写入后已有查询字段及排序口径不改变。
+
+参数校验（在拉取任何区块之前）：起始区块大于结束区块、起始区块或
+结束区块小于零、批量大小不在 1 到 1000 范围、链标识为空白时抛
+`ValueError`。
+
+### submit 返回
+
+成功返回机器可读结果：
+
+```json
+{
+  "status": "ok",
+  "chain_id": "chain-a",
+  "range_start": 0,
+  "range_end": 99,
+  "committed_start_block": 0,
+  "committed_end_block": 99,
+  "next_block": 100,
+  "processed_batch_count": 10,
+  "committed_count": 100,
+  "skipped_count": 0,
+  "last_batch_committed_at": 1791140000.0
+}
+```
+
+- 范围与已提交水位重叠时，已覆盖部分不重新拉取，只从下一待处理区块
+  续跑；整个范围都已被水位覆盖时直接返回幂等结果
+  （`processed_batch_count` / `committed_count` / `skipped_count`
+  均为 `0`）。
+- `committed_count` 为本范围真正新增的交易数；`skipped_count` 为
+  重新拉取到的批次中同哈希同内容的重复交易数；
+  `last_batch_committed_at` 为该链最近成功批次时间（UTC 秒浮点）。
+
+### 幂等、冲突与断点续传
+
+- 相同交易哈希与相同标准化内容（区块高度、区块时间、发起地址、接收
+  地址、方法标识）再次出现时视为重复：不新增记录，也不改变首次写入
+  结果，计入 `skipped_count`。
+- 相同交易哈希却出现不同区块高度、时间、地址或方法标识时抛
+  `TransactionConflictError`，停止当前批次，水位**不**推进到冲突交易
+  所在批次；同批中冲突交易之前已校验的交易也不可见。
+- 批次只在整批成功后提交（先完整校验标准化，再整批写入并推进水位），
+  中途失败不会留下半批已更新、半批未更新的结果。
+- 上游暂时无法返回指定区块时抛 `SourceUnavailableError`（fetch 自身
+  抛出，或返回列表缺少区间内任一区块）。已完整提交的前序批次和水位
+  保持有效；网络恢复后用原参数原样重放整个范围即可——已覆盖部分幂等
+  跳过，从未完成批次继续，最终结果与一次性成功完全一致。
+- 不允许越过尚未提交的低区块形成更高水位：如已提交到 5 却直接提交
+  `[7, 9]` 会抛 `ValueError`；不同链水位相互独立。
+
+### status 只读状态入口
+
+`status(chain_id, start_block=None)` 只返回水位、不扫描交易明细，也
+不改变索引：
+
+```json
+{
+  "chain_id": "chain-a",
+  "committed_start_block": 0,
+  "committed_end_block": 99,
+  "next_block": 100,
+  "last_batch_committed_at": 1791140000.0
+}
+```
+
+尚未开始索引的链返回已提交区间为 `null`，`next_block` 等于本次传入
+的 `start_block`；未传入 `start_block` 时返回 `null`（该链也从未配置
+过起始区块）。`start_block` 为负整数时抛 `ValueError`。
+
+### 并发语义
+
+同一链的并发提交按区块顺序串行化：
+
+- 相同范围并发提交合并为幂等结果：只有一个提交者真正执行批次，另一个
+  等待其完成后返回同一水位结果；
+- 不同范围不能越过尚未提交的低区块形成更高水位：后到的高范围等待
+  前一低范围完成后继续；
+- 任一提交失败（如冲突）都只影响其未提交批次，最终水位始终覆盖从
+  已配置起始区块起的连续已提交区间；
+- 不同链互不阻塞。
+
+新功能启用后，单次查询、全部聚合统计与分页游标继续返回原有格式、
+过滤语义、排序和兼容结果。
+
 ## 错误处理
 
 领域错误输出到 stderr（单行 JSON，含 `error`、`message`、`input_line`），退出码为 `2`。只有输入数据行错误才带 1 起始行号，其余错误 `input_line` 为 `null`。
@@ -328,16 +443,26 @@ result = importer.replace_from(
 | `invalid_filter` | 筛选值为空白、`--address` 与 `--from-address` / `--to-address` 并用，或 counterparty-stats 缺少 `--address`（读取数据文件前报错） |
 | `invalid_bucket_size` | `--bucket-size` 缺失、非整数或不大于 0（time-stats / address-time-stats，读取数据文件前报错） |
 
+索引水位与幂等重放（`ReplayManager`）使用 Python 原生异常，不走 CLI
+错误输出：
+
+| 异常 | error 码 | 触发条件 |
+| --- | --- | --- |
+| `ValueError` | — | 起始区块大于结束区块、起止区块为负、批量大小不在 1..1000、链标识空白、交易/区块结构非法或越过未提交低区块 |
+| `SourceUnavailableError` | `source_unavailable` | 上游暂时无法返回指定区块（fetch 抛出或返回缺少区间内区块） |
+| `TransactionConflictError` | `transaction_conflict` | 相同交易哈希再次出现但区块高度、时间、地址或方法标识不同 |
+
 ## 代码结构
 
 - `tx_indexer/loader.py`：JSON Lines 解析与校验
 - `tx_indexer/engine.py`：筛选、排序、keyset 游标分页、聚合
 - `tx_indexer/cursor.py`：不透明游标编解码（base64url），含独立的导入游标
 - `tx_indexer/importer.py`：增量交易导入与断点续传
-- `tx_indexer/errors.py`：七类异常
+- `tx_indexer/replay.py`：索引水位与幂等重放（按链水位、原子批次、并发串行化）
+- `tx_indexer/errors.py`：异常类型
 - `tx_indexer/cli.py`：命令行入口
 - `tests/`：unittest 测试（`python3 -m unittest discover -s tests`）
 
 ## 状态
 
-已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按参与地址分页汇总（address-stats）、按交易对手分页汇总（counterparty-stats）、按固定宽度时间区间分页汇总（time-stats）、按有向交易对分页汇总（pair-stats）、按时间区间 × 参与地址分页汇总（address-time-stats）与七类异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选；增量交易导入与断点续传（原子批次、重试判重、四类机器可读拒绝码、独立导入游标）；链重组后缀替换（`replace_from`，原子覆盖已导入高度至链尖、保留更低前缀、旧后缀同名不冲突、四类计数字段与 `INVALID_REPLACEMENT_BATCH` 拒绝码）。
+已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按参与地址分页汇总（address-stats）、按交易对手分页汇总（counterparty-stats）、按固定宽度时间区间分页汇总（time-stats）、按有向交易对分页汇总（pair-stats）、按时间区间 × 参与地址分页汇总（address-time-stats）与领域异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选；增量交易导入与断点续传（原子批次、重试判重、四类机器可读拒绝码、独立导入游标）；链重组后缀替换（`replace_from`，原子覆盖已导入高度至链尖、保留更低前缀、旧后缀同名不冲突、四类计数字段与 `INVALID_REPLACEMENT_BATCH` 拒绝码）；索引水位与幂等重放（`ReplayManager.submit` / `status`：按链连续水位、升序分批、整批原子提交、重复跳过、`TransactionConflictError` 冲突停止、`SourceUnavailableError` 断点续传、同链并发合并/等待、不扫描明细的只读状态入口）。
