@@ -27,6 +27,7 @@ SCOPE_ADDRESS_STATS = "address-stats"
 SCOPE_COUNTERPARTY_STATS = "counterparty-stats"
 SCOPE_TIME_STATS = "time-stats"
 SCOPE_PAIR_STATS = "pair-stats"
+SCOPE_ADDRESS_TIME_STATS = "address-time-stats"
 
 
 def _as_sorted_list(value):
@@ -302,7 +303,6 @@ def encode_pair_stats_cursor(filters, after_total_amount, after_count,
     }
     return _encode_payload(payload)
 
-
 def decode_pair_stats_cursor(token, filters):
     """解码并校验 pair-stats 游标。
 
@@ -329,3 +329,69 @@ def decode_pair_stats_cursor(token, filters):
         raise InvalidCursorError("游标位置信息非法", None)
 
     return after[0], after[1], after[2], after[3]
+
+
+def encode_address_time_stats_cursor(filters, bucket_size,
+                                     after_bucket_start, after_total_amount,
+                                     after_total_count, after_send_count,
+                                     after_receive_count, after_address):
+    """address-time-stats 游标：除筛选外还绑定 bucket_size，不绑定 page_size。"""
+    payload = {
+        "v": _CURSOR_VERSION,
+        "c": SCOPE_ADDRESS_TIME_STATS,
+        "f": _canonical_filters(filters),
+        "b": bucket_size,
+        "after": [
+            after_bucket_start,
+            after_total_amount,
+            after_total_count,
+            after_send_count,
+            after_receive_count,
+            after_address,
+        ],
+    }
+    return _encode_payload(payload)
+
+
+def decode_address_time_stats_cursor(token, filters, bucket_size):
+    """解码并校验 address-time-stats 游标。
+
+    返回 exclusive marker ``(bucket_start, total_amount, total_count,
+    send_count, receive_count, address)``。游标内 bucket_size 与当前
+    请求不一致时报 InvalidCursorError。
+    """
+    payload = _decode_payload(token, filters, SCOPE_ADDRESS_TIME_STATS)
+
+    saved_bucket_size = payload.get("b")
+    if (
+        not isinstance(saved_bucket_size, int)
+        or isinstance(saved_bucket_size, bool)
+        or saved_bucket_size != bucket_size
+    ):
+        raise InvalidCursorError("游标与当前 bucket_size 不匹配", None)
+
+    after = payload.get("after")
+    if (
+        not isinstance(after, list)
+        or len(after) != 6
+        or not isinstance(after[0], int)
+        or isinstance(after[0], bool)
+        or after[0] < 0
+        or not isinstance(after[1], int)
+        or isinstance(after[1], bool)
+        or after[1] < 0
+        or not isinstance(after[2], int)
+        or isinstance(after[2], bool)
+        or after[2] < 1
+        or not isinstance(after[3], int)
+        or isinstance(after[3], bool)
+        or after[3] < 0
+        or not isinstance(after[4], int)
+        or isinstance(after[4], bool)
+        or after[4] < 0
+        or not isinstance(after[5], str)
+        or after[5] == ""
+    ):
+        raise InvalidCursorError("游标位置信息非法", None)
+
+    return after[0], after[1], after[2], after[3], after[4], after[5]

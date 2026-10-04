@@ -1357,5 +1357,310 @@ class PairStatsTest(unittest.TestCase):
         self.assertEqual(group["avg_amount"], str((int(big) + 10) // 2))
 
 
+class AddressTimeStatsTest(unittest.TestCase):
+    def setUp(self):
+        self.records = [
+            rec("h1", 1, 10, "alice", "bob", "transfer", "10"),
+            rec("h2", 2, 20, "bob", "alice", "approve", "21"),
+            rec("h3", 2, 30, "alice", "carol", "transfer", "5"),
+            rec("h4", 3, 300, "bob", "dave", "transfer", "40"),
+            rec("h5", 4, 50, "carol", "dave", "transfer", "100"),
+        ]
+        self.idx = TxIndexer(self.records)
+        self.filters = normalize_filters()
+
+    def test_grouping_and_aggregation(self):
+        result = self.idx.address_time_stats(self.filters, 60)
+        groups = result["groups"]
+        self.assertEqual(
+            [(g["address"], g["bucket_start"], g["bucket_end_exclusive"],
+              g["send_count"], g["receive_count"], g["total_count"],
+              g["total_amount"], g["avg_amount"]) for g in groups],
+            [
+                ("carol", 0, 60, 1, 1, 2, "105", "52"),  # 105 // 2
+                ("dave", 0, 60, 0, 1, 1, "100", "100"),
+                ("alice", 0, 60, 2, 1, 3, "36", "12"),   # 36 // 3
+                ("bob", 0, 60, 1, 1, 2, "31", "15"),     # 31 // 2
+                ("bob", 300, 360, 1, 0, 1, "40", "40"),
+                ("dave", 300, 360, 0, 1, 1, "40", "40"),
+            ],
+        )
+        self.assertEqual(result["total_groups"], 6)
+        self.assertIsNone(result["next_cursor"])
+
+    def test_group_field_order(self):
+        result = self.idx.address_time_stats(self.filters, 60)
+        self.assertEqual(
+            list(result.keys()), ["groups", "total_groups", "next_cursor"]
+        )
+        group = result["groups"][0]
+        self.assertEqual(
+            list(group.keys()),
+            ["address", "bucket_start", "bucket_end_exclusive",
+             "send_count", "receive_count", "total_count",
+             "total_amount", "avg_amount"],
+        )
+        self.assertIsInstance(group["bucket_start"], int)
+        self.assertIsInstance(group["bucket_end_exclusive"], int)
+        self.assertIsInstance(group["total_amount"], str)
+        self.assertIsInstance(group["avg_amount"], str)
+
+    def test_bucket_alignment_epoch_left_closed_right_open(self):
+        records = [
+            rec("b0", 1, 0, "a", "b", "m", "1"),
+            rec("b59", 2, 59, "a", "b", "m", "2"),
+            rec("b60", 3, 60, "a", "b", "m", "4"),
+            rec("b119", 4, 119, "a", "b", "m", "8"),
+            rec("b120", 5, 120, "a", "b", "m", "16"),
+        ]
+        result = TxIndexer(records).address_time_stats(self.filters, 60)
+        # 每个非空区间有 a、b 两组；总额并列时 count/send 高的发送方在前，
+        # bucket 0 各项并列按地址码点
+        self.assertEqual(
+            [(g["bucket_start"], g["address"], g["total_amount"])
+             for g in result["groups"]],
+            [
+                (0, "a", "3"), (0, "b", "3"),
+                (60, "a", "12"), (60, "b", "12"),
+                (120, "a", "16"), (120, "b", "16"),
+            ],
+        )
+        self.assertEqual(result["total_groups"], 6)
+
+    def test_self_transfer_single_group_all_three_counts_amount_once(self):
+        records = [
+            rec("s1", 1, 1, "eva", "eva", "m", "100"),
+            rec("s2", 2, 2, "eva", "eva", "m", "50"),
+            rec("o1", 3, 3, "fin", "gus", "m", "7"),
+        ]
+        result = TxIndexer(records).address_time_stats(
+            normalize_filters(), 60
+        )
+        groups = {(g["bucket_start"], g["address"]): g
+                  for g in result["groups"]}
+        self.assertEqual(set(groups), {
+            (0, "eva"), (0, "fin"), (0, "gus"),
+        })
+        eva = groups[(0, "eva")]
+        self.assertEqual(
+            (eva["send_count"], eva["receive_count"], eva["total_count"]),
+            (2, 2, 2),
+        )
+        self.assertEqual(eva["total_amount"], "150")  # 金额只累计一次/笔
+        self.assertEqual(eva["avg_amount"], "75")
+
+    def test_sort_bucket_start_primary_then_amount_count_send_receive_addr(self):
+        records = [
+            # bucket 0：
+            rec("h1", 1, 1, "a", "x", "m", "5"),
+            rec("h2", 2, 2, "a", "x", "m", "5"),    # x: recv2 total10
+            rec("h3", 3, 3, "a", "y", "m", "10"),   # y: recv1 total10
+            # z、w 总额 8、count 1、send 0 相同 → receive 相同按地址码点
+            rec("h4", 4, 4, "a", "w", "m", "8"),
+            rec("h5", 5, 5, "a", "z", "m", "8"),
+            # bucket 60：receive 相同、count 相同，send 高的排前
+            rec("h6", 6, 60, "p", "q", "m", "10"),  # q: recv1 send0
+            rec("h7", 7, 61, "q", "q", "m", "10"),  # q 自转账: send1 recv1
+        ]
+        result = TxIndexer(records).address_time_stats(
+            normalize_filters(), 60
+        )
+        self.assertEqual(
+            [(g["bucket_start"], g["address"]) for g in result["groups"]],
+            [
+                # a: send4 total36 居首；x/y total10：count2 的 x 在前
+                (0, "a"), (0, "x"), (0, "y"), (0, "w"), (0, "z"),
+                # bucket 60：q(total20, send1) 先于 p(10, send1)
+                (60, "q"), (60, "p"),
+            ],
+        )
+
+    def test_sort_receive_count_tiebreak(self):
+        records = [
+            rec("h1", 1, 1, "x", "x", "m", "10"),  # x: send1 recv1 count1
+            rec("h2", 2, 2, "y", "z", "m", "10"),  # y: send1 recv0 count1
+        ]
+        result = TxIndexer(records).address_time_stats(
+            normalize_filters(), 60
+        )
+        # x 与 y 总额/count/send 相同，receive_count 高的 x 在前；
+        # z receive-only 与 y 总额相同但 count 相同 send 低，故在后
+        self.assertEqual(
+            [g["address"] for g in result["groups"]][:3],
+            ["x", "y", "z"],
+        )
+
+    def test_only_nonempty_bucket_address_groups_returned(self):
+        records = [
+            rec("a", 1, 10, "x", "y", "m", "1"),
+            rec("b", 2, 1000, "x", "y", "m", "2"),
+        ]
+        result = TxIndexer(records).address_time_stats(self.filters, 60)
+        self.assertEqual(
+            [(g["bucket_start"], g["address"]) for g in result["groups"]],
+            [(0, "x"), (0, "y"), (960, "x"), (960, "y")],
+        )
+
+    def test_filters_applied(self):
+        result = self.idx.address_time_stats(
+            normalize_filters(method="transfer"), 60
+        )
+        # h1/h3/h5 在 bucket 0，h4 在 bucket 300；
+        # carol 收 5 又发 100，bucket 0 内总额 105 居首
+        self.assertEqual(
+            [(g["bucket_start"], g["address"], g["total_amount"])
+             for g in result["groups"]],
+            [
+                (0, "carol", "105"),
+                (0, "dave", "100"),
+                (0, "alice", "15"),
+                (0, "bob", "10"),
+                (300, "bob", "40"),
+                (300, "dave", "40"),
+            ],
+        )
+
+    def test_time_window_inclusive_both_ends(self):
+        result = self.idx.address_time_stats(
+            normalize_filters(start_time=10, end_time=20), 60
+        )
+        # h1、h2 命中：alice/bob 各一组
+        self.assertEqual(result["total_groups"], 2)
+        self.assertEqual(
+            [(g["address"], g["total_count"]) for g in result["groups"]],
+            [("alice", 2), ("bob", 2)],
+        )
+
+    def test_no_match(self):
+        result = self.idx.address_time_stats(
+            normalize_filters(method="nonexistent"), 60
+        )
+        self.assertEqual(
+            result, {"groups": [], "total_groups": 0, "next_cursor": None}
+        )
+
+    def test_pagination_no_skip_no_dup_no_reorder(self):
+        all_keys = [
+            (g["bucket_start"], g["address"])
+            for g in self.idx.address_time_stats(
+                self.filters, 60, page_size=100
+            )["groups"]
+        ]
+        collected = []
+        cursor = None
+        pages = 0
+        while True:
+            page = self.idx.address_time_stats(
+                self.filters, 60, page_size=2, cursor=cursor
+            )
+            pages += 1
+            collected.extend(
+                (g["bucket_start"], g["address"]) for g in page["groups"]
+            )
+            self.assertEqual(page["total_groups"], 6)
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(pages, 3)  # 6 组、page_size=2：3 页
+        self.assertEqual(collected, all_keys)
+
+    def test_cursor_not_bound_to_page_size(self):
+        page1 = self.idx.address_time_stats(self.filters, 60, page_size=2)
+        page2 = self.idx.address_time_stats(
+            self.filters, 60, page_size=100, cursor=page1["next_cursor"]
+        )
+        self.assertEqual(
+            [(g["bucket_start"], g["address"]) for g in page2["groups"]],
+            [(0, "alice"), (0, "bob"), (300, "bob"), (300, "dave")],
+        )
+        self.assertIsNone(page2["next_cursor"])
+
+    def test_cursor_bound_to_bucket_size(self):
+        page1 = self.idx.address_time_stats(self.filters, 60, page_size=1)
+        with self.assertRaises(InvalidCursorError):
+            self.idx.address_time_stats(
+                self.filters, 30, page_size=1, cursor=page1["next_cursor"]
+            )
+
+    def test_cursor_bound_to_filters(self):
+        page1 = self.idx.address_time_stats(self.filters, 60, page_size=1)
+        with self.assertRaises(InvalidCursorError):
+            self.idx.address_time_stats(
+                normalize_filters(method="transfer"),
+                60, page_size=1, cursor=page1["next_cursor"],
+            )
+
+    def test_cross_command_cursor_rejected(self):
+        from tx_indexer.cursor import (
+            decode_address_stats_cursor,
+            decode_address_time_stats_cursor,
+            decode_time_stats_cursor,
+            encode_address_stats_cursor,
+            encode_address_time_stats_cursor,
+            encode_time_stats_cursor,
+        )
+
+        filters = normalize_filters()
+        ats_cursor = encode_address_time_stats_cursor(
+            filters, 60, 0, 10, 1, 1, 0, "a"
+        )
+        time_cursor = encode_time_stats_cursor(filters, 60, 0)
+        address_cursor = encode_address_stats_cursor(
+            filters, 10, 1, 1, 0, "a"
+        )
+        with self.assertRaises(InvalidCursorError):
+            decode_address_time_stats_cursor(time_cursor, filters, 60)
+        with self.assertRaises(InvalidCursorError):
+            decode_address_time_stats_cursor(address_cursor, filters, 60)
+        with self.assertRaises(InvalidCursorError):
+            decode_time_stats_cursor(ats_cursor, filters, 60)
+        with self.assertRaises(InvalidCursorError):
+            decode_address_stats_cursor(ats_cursor, filters)
+
+    def test_cursor_garbage(self):
+        for bad in ("", "not-base64!!!", "bm9wZQ", "%%%"):
+            with self.assertRaises(InvalidCursorError):
+                self.idx.address_time_stats(self.filters, 60, cursor=bad)
+
+    def test_cursor_tampered(self):
+        import base64
+        import json
+
+        page1 = self.idx.address_time_stats(self.filters, 60, page_size=1)
+        token = page1["next_cursor"]
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+        payload = json.loads(raw.decode("utf-8"))
+        payload["b"] = 30  # 篡改 bucket_size
+        tampered = base64.urlsafe_b64encode(
+            json.dumps(payload).encode("utf-8")
+        ).rstrip(b"=").decode("ascii")
+        with self.assertRaises(InvalidCursorError):
+            self.idx.address_time_stats(self.filters, 60, cursor=tampered)
+
+    def test_invalid_bucket_size(self):
+        for bad in (0, -1, -60, "60", 1.5, True, None):
+            with self.assertRaises(InvalidBucketSizeError):
+                self.idx.address_time_stats(self.filters, bad)
+
+    def test_invalid_page_size(self):
+        for bad in (0, -1, 1001, "10", None):
+            with self.assertRaises(InvalidPageSizeError):
+                self.idx.address_time_stats(self.filters, 60, page_size=bad)
+
+    def test_big_amounts_exact_decimal(self):
+        big = "123456789012345678901234567890"
+        idx = TxIndexer([
+            rec("x", 1, 1, "a", "b", "m", big),
+            rec("y", 2, 2, "a", "b", "m", "10"),
+        ])
+        result = idx.address_time_stats(normalize_filters(), 60)
+        groups = {(g["address"]): g for g in result["groups"]}
+        total = str(int(big) + 10)
+        self.assertEqual(groups["a"]["total_amount"], total)
+        self.assertEqual(groups["a"]["avg_amount"], str(int(total) // 2))
+        self.assertEqual(groups["b"]["total_amount"], total)
+        self.assertEqual(groups["b"]["avg_amount"], str(int(total) // 2))
+
+
 if __name__ == "__main__":
     unittest.main()
