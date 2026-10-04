@@ -22,6 +22,8 @@ _CURSOR_VERSION = 1
 
 #: 各命令在游标中的作用域标识
 SCOPE_QUERY = "query"
+#: 多链入口 query 的作用域标识（额外绑定 chain_id，与单索引 query 互不可复用）
+SCOPE_MULTICHAIN_QUERY = "multichain-query"
 SCOPE_METHOD_STATS = "method-stats"
 SCOPE_ADDRESS_STATS = "address-stats"
 SCOPE_COUNTERPARTY_STATS = "counterparty-stats"
@@ -116,6 +118,49 @@ def encode_cursor(filters, after_block, after_tx_hash):
 def decode_cursor(token, filters):
     """解码并校验 query 游标，返回 exclusive marker ``(block_number, tx_hash)``。"""
     payload = _decode_payload(token, filters, SCOPE_QUERY)
+
+    after = payload.get("after")
+    if (
+        not isinstance(after, list)
+        or len(after) != 2
+        or not isinstance(after[0], int)
+        or isinstance(after[0], bool)
+        or after[0] < 0
+        or not isinstance(after[1], str)
+        or after[1] == ""
+    ):
+        raise InvalidCursorError("游标位置信息非法", None)
+
+    return after[0], after[1]
+
+
+def encode_multichain_query_cursor(chain_id, filters, after_block,
+                                   after_tx_hash):
+    """多链入口 query 游标：除命令作用域与筛选外还绑定 chain_id。"""
+    payload = {
+        "v": _CURSOR_VERSION,
+        "c": SCOPE_MULTICHAIN_QUERY,
+        "chain": chain_id,
+        "f": _canonical_filters(filters),
+        "after": [after_block, after_tx_hash],
+    }
+    return _encode_payload(payload)
+
+
+def decode_multichain_query_cursor(token, chain_id, filters):
+    """解码并校验多链入口 query 游标。
+
+    返回 exclusive marker ``(block_number, tx_hash)``。游标必须签发自
+    多链 query（不能与单索引 query 游标混用），且内绑 chain_id 与筛选
+    与当前请求完全一致，否则抛 InvalidCursorError。
+    """
+    payload = _decode_payload(token, filters, SCOPE_MULTICHAIN_QUERY)
+
+    saved_chain = payload.get("chain")
+    if not isinstance(saved_chain, str) or saved_chain == "":
+        raise InvalidCursorError("游标链标识非法", None)
+    if saved_chain != chain_id:
+        raise InvalidCursorError("游标与当前链不匹配", None)
 
     after = payload.get("after")
     if (

@@ -4,6 +4,12 @@
 之上提供独立可用的增量索引治理：按链维护「已提交水位」，把同一段链上
 历史安全地重复提交，并在网络中断后从确定位置继续。
 
+:class:`MultiChainReplayManager` 在多个 chain_id 共用同一入口时按链
+隔离：每条链由独立的 :class:`ReplayManager` 承载，拥有独立的交易身份
+台账、查询索引、水位与同链并发串行化，异链互不阻塞、互不影响。相同
+tx_hash 在不同 chain_id 中属于不同交易，区块内容、查询结果与游标均按
+链独立；同链首次写入同样不被覆盖。
+
 公开入口：
 
 - :meth:`ReplayManager.submit`：提交链标识、起始区块、结束区块与批量
@@ -12,6 +18,13 @@
 - :meth:`ReplayManager.status`：只读索引状态，返回已提交起始区块、
   已提交结束区块、下一待处理区块与最近成功批次时间，不扫描交易明细、
   不改变索引
+- :meth:`MultiChainReplayManager.submit` /
+  :meth:`MultiChainReplayManager.status`：按链委派的提交与水位入口，
+  返回字段与 :class:`ReplayManager` 完全一致
+- :meth:`MultiChainReplayManager.query` /
+  :meth:`MultiChainReplayManager.stats`：按链查询与聚合，筛选、时间窗、
+  排序与汇总口径沿用 :class:`~tx_indexer.engine.TxIndexer`，分页游标
+  额外绑定 chain_id
 
 区块数据通过可调用对象 ``fetch_blocks(start, end)`` 按需拉取，返回
 ``{block_number, transactions}`` 映射的列表（顺序不要求，按高度归位）。
@@ -24,17 +37,23 @@
 写入结果；相同交易哈希却出现不同内容时抛
 :class:`~tx_indexer.errors.TransactionConflictError`，停止当前批次，
 水位不推进到冲突交易所在批次。批次只在整批校验通过后提交，中途失败
-不会留下半批结果。
+不会留下半批结果。多链入口下身份判定按链进行：跨链同哈希既不视为
+重复，也不构成冲突。
 
 并发：同一链的提交按区块顺序串行化——相同范围并发提交合并为幂等
 结果，后到的更高范围不能越过尚未提交的低区块形成更高水位，而是等待
 前一范围完成后继续，最终水位始终覆盖连续已提交区间；不同链互不阻塞。
 """
 
+import bisect
 import threading
 import time
 
-from .engine import TxIndexer
+from .cursor import (
+    decode_multichain_query_cursor,
+    encode_multichain_query_cursor,
+)
+from .engine import DEFAULT_PAGE_SIZE, TxIndexer, to_public
 from .errors import SourceUnavailableError, TransactionConflictError
 from .loader import _AMOUNT_RE, _is_nonneg_int, _is_nonempty_text
 
@@ -490,3 +509,163 @@ class ReplayManager:
                 "next_block": committed_end + 1,
                 "last_batch_committed_at": chain["last_batch_at"],
             }
+
+
+def _query_chain_indexer(indexer, chain_id, filters, page_size, cursor):
+    """在单链索引上执行 query，分页游标额外绑定 chain_id。
+
+    筛选、左闭右闭时间窗、排序（block_number、tx_hash 双升序）、返回
+    结构与 :meth:`TxIndexer.query` 完全一致；区别仅在于游标使用
+    multichain-query 作用域，跨链、跨命令或筛选不等价时复用抛
+    InvalidCursorError。
+    """
+    indexer._validate_page_size(page_size)
+
+    matched = indexer._matched(filters)
+    total = len(matched)
+
+    start = 0
+    if cursor is not None:
+        after_block, after_tx_hash = decode_multichain_query_cursor(
+            cursor, chain_id, filters
+        )
+        # keyset 续页：排序键严格大于 marker 的第一个位置。
+        # marker 位于两键之间也安全（bisect 取下一键），不会跳过或重复。
+        keys = [(r["block_number"], r["tx_hash"]) for r in matched]
+        start = bisect.bisect_left(keys, (after_block, after_tx_hash))
+        if start < total and keys[start] == (after_block, after_tx_hash):
+            # marker 命中现存记录本身：从其后一条开始
+            start += 1
+
+    end = start + page_size
+    page = matched[start:end]
+    if end < total:
+        last = page[-1]
+        next_cursor = encode_multichain_query_cursor(
+            chain_id, filters, last["block_number"], last["tx_hash"]
+        )
+    else:
+        next_cursor = None
+
+    return {
+        "transactions": [to_public(r) for r in page],
+        "total": total,
+        "next_cursor": next_cursor,
+    }
+
+
+class MultiChainReplayManager:
+    """多个 chain_id 共用同一入口时按链隔离的提交、水位与查询管理器。
+
+    每条链在首次 :meth:`submit` 时惰性创建一个独立的
+    :class:`ReplayManager`，因而拥有独立的交易身份台账、查询索引、
+    已提交水位与同链并发串行化：
+
+    - 相同 tx_hash 在不同 chain_id 中属于不同交易：区块内容与查询结果
+      按链独立，跨链同哈希既不按重复跳过，也不构成冲突；同链首次写入
+      不被覆盖
+    - :meth:`submit` 的升序分批、整批原子提交、重放跳过、
+      :class:`~tx_indexer.errors.SourceUnavailableError` 续传、同哈希
+      不同标准化内容抛 :class:`~tx_indexer.errors.TransactionConflictError`
+      以及同链并发等待/合并全部沿用 :class:`ReplayManager`；异链提交
+      互不阻塞
+    - :meth:`query` / :meth:`stats` 的筛选、左闭右闭时间窗、排序与
+      汇总口径沿用 :class:`~tx_indexer.engine.TxIndexer`；分页游标绑定
+      query 命令、chain_id 与等价筛选
+
+    上游区块由构造参数 ``fetch_blocks`` 提供（签名同
+    :class:`ReplayManager`），也可以在每次 :meth:`submit` 时通过同名
+    参数覆盖；两处都没有可调用对象时 :meth:`submit` 抛 ValueError。
+    """
+
+    def __init__(self, fetch_blocks=None):
+        if fetch_blocks is not None and not callable(fetch_blocks):
+            raise ValueError("fetch_blocks 必须可调用")
+        self._fetch_blocks = fetch_blocks
+        # chain_id -> 该链专属的 ReplayManager（首次提交时创建）
+        self._managers = {}
+        # 只保护 _managers 的创建/取链；各链并发由链内管理器自行串行
+        self._registry_lock = threading.Lock()
+
+    def _get_manager(self, chain_id, create=False):
+        if not create:
+            return self._managers.get(chain_id)
+        with self._registry_lock:
+            manager = self._managers.get(chain_id)
+            if manager is None:
+                # 独立索引、独立 tx_hash 台账、独立水位与并发条件变量：
+                # 跨链同哈希互不判重、互不冲突，异链提交也不共享锁
+                manager = ReplayManager(self._fetch_blocks)
+                self._managers[chain_id] = manager
+            return manager
+
+    def submit(self, chain_id, start_block, end_block, batch_size,
+               fetch_blocks=None):
+        """提交某条链的 ``[start_block, end_block]``（闭区间、升序分批）。
+
+        校验顺序、错误类型、分批与原子提交语义、并发行为与返回字段与
+        :meth:`ReplayManager.submit` 完全一致；身份判定与水位只在同一
+        chain_id 内有效。``fetch_blocks`` 给定时覆盖构造函数提供的
+        拉取函数；最终没有任何可调用拉取函数时抛 ValueError。
+        """
+        # 校验顺序沿用 ReplayManager：范围/批量 -> chain_id -> fetcher，
+        # 全部通过后才创建该链管理器，非法请求不留下链状态
+        _validate_range(start_block, end_block, batch_size)
+        if not _is_nonempty_text(chain_id):
+            raise ValueError("chain_id 必须为非空字符串")
+        fetcher = fetch_blocks if fetch_blocks is not None else self._fetch_blocks
+        if not callable(fetcher):
+            raise ValueError("必须提供可调用的 fetch_blocks")
+
+        manager = self._get_manager(chain_id, create=True)
+        return manager.submit(
+            chain_id, start_block, end_block, batch_size,
+            fetch_blocks=fetcher,
+        )
+
+    def status(self, chain_id, start_block=None):
+        """只读返回某条链的索引水位状态，字段与 :meth:`ReplayManager.status` 一致。
+
+        尚未开始的链不创建状态：已提交区间为 ``None``，``next_block``
+        等于传入的 ``start_block``（未传入为 ``None``）。chain_id 空白
+        或 start_block 为负抛 ValueError。
+        """
+        manager = self._get_manager(chain_id)
+        if manager is None:
+            # 用一次性管理器复用完全相同的校验与「未知链」返回口径，
+            # 不注册链、不改变任何状态
+            return ReplayManager().status(chain_id, start_block)
+        return manager.status(chain_id, start_block)
+
+    def query(self, chain_id, filters, page_size=DEFAULT_PAGE_SIZE, cursor=None):
+        """按链分页查询，返回 ``{transactions, total, next_cursor}``。
+
+        筛选、左闭右闭时间窗、排序、返回结构沿用
+        :meth:`TxIndexer.query`；游标额外绑定 chain_id，跨链或改筛选
+        复用抛 :class:`~tx_indexer.errors.InvalidCursorError`，
+        page_size 非法抛
+        :class:`~tx_indexer.errors.InvalidPageSizeError`，筛选非法抛
+        :class:`~tx_indexer.errors.InvalidFilterError` /
+        :class:`~tx_indexer.errors.InvalidTimeRangeError`。尚未开始的
+        链按空索引处理：transactions 为空、total 为 0、next_cursor 为
+        None（携带与该链及筛选不匹配的游标仍抛 InvalidCursorError）。
+        """
+        if not _is_nonempty_text(chain_id):
+            raise ValueError("chain_id 必须为非空字符串")
+        manager = self._get_manager(chain_id)
+        indexer = manager.indexer if manager is not None else TxIndexer([])
+        return _query_chain_indexer(
+            indexer, chain_id, filters, page_size, cursor
+        )
+
+    def stats(self, chain_id, filters):
+        """按链聚合统计，筛选与汇总口径沿用 :meth:`TxIndexer.stats`。
+
+        尚未开始的链返回无匹配结果（total_count 为 0、total_amount 为
+        ``"0"``、min/max/avg 均为 None）。
+        """
+        if not _is_nonempty_text(chain_id):
+            raise ValueError("chain_id 必须为非空字符串")
+        manager = self._get_manager(chain_id)
+        indexer = manager.indexer if manager is not None else TxIndexer([])
+        return indexer.stats(filters)

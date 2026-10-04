@@ -27,7 +27,7 @@ from .importer import (
     TX_CONFLICT,
     IncrementalImporter,
 )
-from .replay import ReplayManager
+from .replay import MultiChainReplayManager, ReplayManager
 
 __all__ = [
     "BLOCK_CONFLICT",
@@ -41,6 +41,7 @@ __all__ = [
     "InvalidPageSizeError",
     "InvalidTimeRangeError",
     "InvalidTransactionError",
+    "MultiChainReplayManager",
     "ReplayManager",
     "SourceUnavailableError",
     "TX_CONFLICT",
