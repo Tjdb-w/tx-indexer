@@ -1,5 +1,6 @@
 """命令行入口：``tx-indexer query`` / ``stats`` / ``method-stats`` /
-``address-stats`` / ``counterparty-stats`` / ``time-stats``。
+``address-stats`` / ``counterparty-stats`` / ``time-stats`` /
+``pair-stats``。
 
 用法：
     tx-indexer query <data.jsonl> [筛选与分页选项]
@@ -8,6 +9,7 @@
     tx-indexer address-stats <data.jsonl> [筛选与分页选项]
     tx-indexer counterparty-stats <data.jsonl> --address ADDR [筛选与分页选项]
     tx-indexer time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
+    tx-indexer pair-stats <data.jsonl> [筛选与分页选项]
 
 领域错误（invalid_transaction / duplicate_transaction / invalid_time_range /
 invalid_page_size / invalid_cursor / invalid_filter / invalid_bucket_size）
@@ -183,6 +185,21 @@ def build_parser():
         "--cursor", help="上一页返回的 next_cursor"
     )
 
+    pair_stats_parser = subparsers.add_parser(
+        "pair-stats",
+        help="按有向交易对分页汇总（返回 groups/total_groups/next_cursor）",
+    )
+    pair_stats_parser.add_argument("file", help="JSON Lines 数据文件路径")
+    _add_filter_args(pair_stats_parser)
+    pair_stats_parser.add_argument(
+        "--page-size",
+        default=str(DEFAULT_PAGE_SIZE),
+        help="每页分组数，1 到 1000，默认 100",
+    )
+    pair_stats_parser.add_argument(
+        "--cursor", help="上一页返回的 next_cursor"
+    )
+
     return parser
 
 
@@ -223,6 +240,7 @@ def main(argv=None):
             "address-stats",
             "counterparty-stats",
             "time-stats",
+            "pair-stats",
         ):
             page_size = _parse_page_size(args.page_size)
         bucket_size = None
@@ -258,6 +276,10 @@ def main(argv=None):
         elif args.command == "time-stats":
             result = indexer.time_stats(
                 filters, bucket_size, page_size=page_size, cursor=args.cursor
+            )
+        elif args.command == "pair-stats":
+            result = indexer.pair_stats(
+                filters, page_size=page_size, cursor=args.cursor
             )
         else:
             result = indexer.stats(filters)

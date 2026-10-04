@@ -1154,5 +1154,208 @@ class TimeStatsTest(unittest.TestCase):
         self.assertEqual(group["avg_amount"], str((int(big) + 10) // 2))
 
 
+class PairStatsTest(unittest.TestCase):
+    def setUp(self):
+        self.records = [
+            rec("h1", 1, 10, "alice", "bob", "transfer", "10"),
+            rec("h2", 2, 20, "bob", "alice", "transfer", "21"),
+            rec("h3", 2, 30, "alice", "carol", "transfer", "5"),
+            rec("h4", 3, 300, "alice", "bob", "approve", "5"),
+            rec("h5", 4, 40, "alice", "alice", "transfer", "100"),
+        ]
+        self.idx = TxIndexer(self.records)
+        self.filters = normalize_filters()
+
+    def test_directed_grouping_and_aggregation(self):
+        result = self.idx.pair_stats(self.filters)
+        groups = result["groups"]
+        self.assertEqual(
+            [(g["from_address"], g["to_address"], g["total_count"],
+              g["total_amount"], g["avg_amount"]) for g in groups],
+            [
+                ("alice", "alice", 1, "100", "100"),
+                ("bob", "alice", 1, "21", "21"),
+                ("alice", "bob", 2, "15", "7"),   # 15 // 2
+                ("alice", "carol", 1, "5", "5"),
+            ],
+        )
+        self.assertEqual(result["total_groups"], 4)
+        self.assertIsNone(result["next_cursor"])
+
+    def test_direction_makes_distinct_groups(self):
+        # alice→bob 与 bob→alice 必须是两个不同的有向分组
+        result = self.idx.pair_stats(self.filters)
+        keys = [(g["from_address"], g["to_address"]) for g in result["groups"]]
+        self.assertIn(("alice", "bob"), keys)
+        self.assertIn(("bob", "alice"), keys)
+
+    def test_self_transfer_counted_once(self):
+        records = [
+            rec("s1", 1, 1, "alice", "alice", "m", "10"),
+            rec("s2", 2, 2, "alice", "alice", "m", "11"),
+        ]
+        result = TxIndexer(records).pair_stats(self.filters)
+        self.assertEqual(result["total_groups"], 1)
+        group = result["groups"][0]
+        self.assertEqual(
+            (group["from_address"], group["to_address"],
+             group["total_count"], group["total_amount"],
+             group["avg_amount"]),
+            ("alice", "alice", 2, "21", "10"),  # 21 // 2
+        )
+
+    def test_result_field_order(self):
+        result = self.idx.pair_stats(self.filters)
+        self.assertEqual(
+            list(result.keys()), ["groups", "total_groups", "next_cursor"]
+        )
+        group = result["groups"][0]
+        self.assertEqual(
+            list(group.keys()),
+            ["from_address", "to_address", "total_count",
+             "total_amount", "avg_amount"],
+        )
+        self.assertIsInstance(group["total_amount"], str)
+        self.assertIsInstance(group["avg_amount"], str)
+
+    def test_sort_amount_then_count_then_from_then_to(self):
+        records = [
+            # a→x 与 b→x total 均为 10、count 均为 1：按 from 码点
+            rec("h1", 1, 1, "a", "x", "m", "10"),
+            rec("h2", 2, 2, "b", "x", "m", "10"),
+            # a→y count=2 total=10：count 高于上面两组，应在它们之前
+            rec("h3", 3, 3, "a", "y", "m", "4"),
+            rec("h4", 4, 4, "a", "y", "m", "6"),
+            # a→z total=11：total 最高，应最前
+            rec("h5", 5, 5, "a", "z", "m", "11"),
+        ]
+        result = TxIndexer(records).pair_stats(self.filters)
+        self.assertEqual(
+            [(g["from_address"], g["to_address"])
+             for g in result["groups"]],
+            [("a", "z"), ("a", "y"), ("a", "x"), ("b", "x")],
+        )
+
+    def test_no_match(self):
+        result = self.idx.pair_stats(normalize_filters(method="nope"))
+        self.assertEqual(
+            result, {"groups": [], "total_groups": 0, "next_cursor": None}
+        )
+
+    def test_filters_intersect_before_grouping(self):
+        result = self.idx.pair_stats(
+            normalize_filters(
+                from_address=["alice"], method=["transfer"],
+                start_time=10, end_time=30,
+            )
+        )
+        # h1(alice→bob,10) 与 h3(alice→carol,5) 命中；
+        # h4 是 approve、h5 ts=40 超出时间窗
+        self.assertEqual(
+            [(g["from_address"], g["to_address"], g["total_amount"])
+             for g in result["groups"]],
+            [("alice", "bob", "10"), ("alice", "carol", "5")],
+        )
+        self.assertEqual(result["total_groups"], 2)
+
+    def test_pagination_no_skip_no_dup_no_reorder(self):
+        all_pairs = [
+            (g["from_address"], g["to_address"])
+            for g in self.idx.pair_stats(self.filters, page_size=100)["groups"]
+        ]
+        collected = []
+        cursor = None
+        pages = 0
+        while True:
+            page = self.idx.pair_stats(
+                self.filters, page_size=2, cursor=cursor
+            )
+            pages += 1
+            collected.extend(
+                (g["from_address"], g["to_address"]) for g in page["groups"]
+            )
+            self.assertEqual(page["total_groups"], 4)
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(pages, 2)  # 4 组、page_size=2：恰好 2 页
+        self.assertEqual(collected, all_pairs)
+
+    def test_cursor_not_bound_to_page_size(self):
+        page1 = self.idx.pair_stats(self.filters, page_size=1)
+        self.assertEqual(
+            [(g["from_address"], g["to_address"]) for g in page1["groups"]],
+            [("alice", "alice")],
+        )
+        page2 = self.idx.pair_stats(
+            self.filters, page_size=100, cursor=page1["next_cursor"]
+        )
+        self.assertEqual(
+            [(g["from_address"], g["to_address"]) for g in page2["groups"]],
+            [("bob", "alice"), ("alice", "bob"), ("alice", "carol")],
+        )
+        self.assertIsNone(page2["next_cursor"])
+
+    def test_cursor_bound_to_filters(self):
+        page1 = self.idx.pair_stats(self.filters, page_size=1)
+        with self.assertRaises(InvalidCursorError):
+            self.idx.pair_stats(
+                normalize_filters(method="transfer"),
+                page_size=1,
+                cursor=page1["next_cursor"],
+            )
+
+    def test_cross_command_cursor_rejected_both_ways(self):
+        from tx_indexer.cursor import (
+            decode_method_stats_cursor,
+            decode_pair_stats_cursor,
+            encode_method_stats_cursor,
+            encode_pair_stats_cursor,
+        )
+
+        filters = self.filters
+        pair_cursor = encode_pair_stats_cursor(filters, 10, 1, "a", "b")
+        method_cursor = encode_method_stats_cursor(filters, 10, 1, "m")
+        with self.assertRaises(InvalidCursorError):
+            decode_pair_stats_cursor(method_cursor, filters)
+        with self.assertRaises(InvalidCursorError):
+            decode_method_stats_cursor(pair_cursor, filters)
+
+    def test_cursor_garbage(self):
+        for bad in ("", "not-base64!!!", "bm9wZQ", "%%%"):
+            with self.assertRaises(InvalidCursorError):
+                self.idx.pair_stats(self.filters, cursor=bad)
+
+    def test_cursor_tampered(self):
+        import base64
+        import json
+
+        page1 = self.idx.pair_stats(self.filters, page_size=1)
+        token = page1["next_cursor"]
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+        payload = json.loads(raw.decode("utf-8"))
+        payload["after"] = ["not", "an", "int", "marker"]
+        tampered = base64.urlsafe_b64encode(
+            json.dumps(payload).encode("utf-8")
+        ).rstrip(b"=").decode("ascii")
+        with self.assertRaises(InvalidCursorError):
+            self.idx.pair_stats(self.filters, cursor=tampered)
+
+    def test_invalid_page_size(self):
+        for bad in (0, -1, 1001, "10", None):
+            with self.assertRaises(InvalidPageSizeError):
+                self.idx.pair_stats(self.filters, page_size=bad)
+
+    def test_big_amounts_exact_decimal(self):
+        big = "123456789012345678901234567890"
+        idx = TxIndexer([
+            rec("x", 1, 1, "a", "b", "m", big),
+            rec("y", 2, 2, "a", "b", "m", "10"),
+        ])
+        group = idx.pair_stats(self.filters)["groups"][0]
+        self.assertEqual(group["total_amount"], str(int(big) + 10))
+        self.assertEqual(group["avg_amount"], str((int(big) + 10) // 2))
+
+
 if __name__ == "__main__":
     unittest.main()

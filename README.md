@@ -31,6 +31,7 @@
 ./tx-indexer address-stats <data.jsonl> [选项]
 ./tx-indexer counterparty-stats <data.jsonl> --address ADDR [选项]
 ./tx-indexer time-stats <data.jsonl> --bucket-size SECONDS [选项]
+./tx-indexer pair-stats <data.jsonl> [选项]
 ```
 
 也可以用 `python3 -m tx_indexer ...`。
@@ -45,7 +46,7 @@
 
 集合类选项（`--from-address` / `--to-address` / `--method`）重复给定相同值等同一个条件。筛选值为空或仅含空白、或 `--address` 与付款方/收款方筛选并用，会在读取数据文件前报 `invalid_filter`。
 
-`query`、`method-stats`、`address-stats`、`counterparty-stats` 与 `time-stats` 额外选项：
+`query`、`method-stats`、`address-stats`、`counterparty-stats`、`time-stats` 与 `pair-stats` 额外选项：
 
 - `--page-size N`：每页条数，默认 `100`，范围 1..1000
 - `--cursor TOKEN`：上一页返回的 `next_cursor`
@@ -163,6 +164,25 @@
 - 末页 `next_cursor` 为 `null`。游标不透明且自校验，绑定 time-stats、等价筛选与 `bucket_size`，不绑定 `page-size`；跨命令复用、改变筛选或 `bucket_size`、篡改或解码失败都会报 `invalid_cursor`。
 - 无匹配时：`groups` 为 `[]`、`total_groups` 为 `0`、`next_cursor` 为 `null`。
 
+### pair-stats 返回
+
+把匹配交易按 `from_address` 到 `to_address` 的原字符串有向组合各归一组：`a→b` 与 `b→a` 是两个不同分组，自转账（from 与 to 相同）也累计一次。每组含 `total_count`、`total_amount`，金额为十进制整数字符串，`avg_amount = total_amount // total_count` 向下取整。分组按 `total_amount` 数值降序、`total_count` 降序、`from_address` 的 Unicode 码点升序、`to_address` 的 Unicode 码点升序确定唯一顺序：
+
+```json
+{
+  "groups": [
+    {"from_address": "bob", "to_address": "alice", "total_count": 1, "total_amount": "21", "avg_amount": "21"},
+    {"from_address": "alice", "to_address": "bob", "total_count": 2, "total_amount": "15", "avg_amount": "7"}
+  ],
+  "total_groups": 2,
+  "next_cursor": null
+}
+```
+
+- `total_groups` 为全部有向组合数（不是当前页分组数）。
+- 末页 `next_cursor` 为 `null`。游标不透明且自校验，只允许在相同命令及等价筛选条件下续用，不绑定 `page-size`；跨命令复用（如把其他命令的游标用于 pair-stats）、改变筛选条件、篡改或解码失败都会报 `invalid_cursor`。
+- 无匹配时：`groups` 为 `[]`、`total_groups` 为 `0`、`next_cursor` 为 `null`。
+
 ## 错误处理
 
 领域错误输出到 stderr（单行 JSON，含 `error`、`message`、`input_line`），退出码为 `2`。只有输入数据行错误才带 1 起始行号，其余错误 `input_line` 为 `null`。
@@ -188,4 +208,4 @@
 
 ## 状态
 
-已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按参与地址分页汇总（address-stats）、按交易对手分页汇总（counterparty-stats）、按固定宽度时间区间分页汇总（time-stats）与七类异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选。
+已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按参与地址分页汇总（address-stats）、按交易对手分页汇总（counterparty-stats）、按固定宽度时间区间分页汇总（time-stats）、按有向交易对分页汇总（pair-stats）与七类异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选。
