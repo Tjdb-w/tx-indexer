@@ -4,6 +4,7 @@ import unittest
 
 from tx_indexer.engine import TxIndexer, normalize_filters
 from tx_indexer.errors import (
+    InvalidBucketSizeError,
     InvalidCursorError,
     InvalidFilterError,
     InvalidPageSizeError,
@@ -924,6 +925,246 @@ class CounterpartyStatsTest(unittest.TestCase):
         result = idx.counterparty_stats(normalize_filters(address="a"))
         group = result["groups"][0]
         self.assertEqual(group["counterparty"], "b")
+        self.assertEqual(group["total_amount"], big)
+        self.assertEqual(group["avg_amount"], big)
+
+
+class TimeStatsTest(unittest.TestCase):
+    def setUp(self):
+        self.records = [
+            rec("h1", 1, 0, "a", "b", "transfer", "3"),
+            rec("h2", 2, 9, "a", "b", "transfer", "4"),
+            rec("h3", 3, 10, "a", "b", "transfer", "100"),
+            rec("h4", 4, 25, "a", "b", "transfer", "5"),
+        ]
+        self.idx = TxIndexer(self.records)
+
+    def test_epoch_aligned_left_closed_right_open_buckets(self):
+        result = self.idx.time_stats(normalize_filters(), bucket_size=10)
+        self.assertEqual(
+            [
+                (g["bucket_start"], g["bucket_end_exclusive"],
+                 g["total_count"], g["total_amount"], g["avg_amount"])
+                for g in result["groups"]
+            ],
+            [
+                (0, 10, 2, "7", "3"),    # ts 0、9，7 // 2
+                (10, 20, 1, "100", "100"),  # ts 10 属于 [10,20)
+                (20, 30, 1, "5", "5"),   # ts 25
+            ],
+        )
+        self.assertEqual(result["total_groups"], 3)
+        self.assertIsNone(result["next_cursor"])
+
+    def test_empty_buckets_are_skipped(self):
+        records = [
+            rec("h1", 1, 0, "a", "b", "m", "1"),
+            rec("h2", 2, 100, "a", "b", "m", "2"),
+        ]
+        result = TxIndexer(records).time_stats(
+            normalize_filters(), bucket_size=10
+        )
+        # 0-10 与 100-110 之间的空区间不出现
+        self.assertEqual(
+            [g["bucket_start"] for g in result["groups"]], [0, 100]
+        )
+        self.assertEqual(result["total_groups"], 2)
+
+    def test_bucket_start_aligned_to_epoch(self):
+        records = [
+            rec("h1", 1, 23, "a", "b", "m", "1"),
+            rec("h2", 2, 29, "a", "b", "m", "1"),
+            rec("h3", 3, 30, "a", "b", "m", "1"),
+        ]
+        result = TxIndexer(records).time_stats(
+            normalize_filters(), bucket_size=15
+        )
+        # 23、29 落入 [15,30)，30 落入 [30,45)
+        self.assertEqual(
+            [
+                (g["bucket_start"], g["bucket_end_exclusive"],
+                 g["total_count"])
+                for g in result["groups"]
+            ],
+            [(15, 30, 2), (30, 45, 1)],
+        )
+
+    def test_group_field_order_and_types(self):
+        group = self.idx.time_stats(
+            normalize_filters(), bucket_size=10
+        )["groups"][0]
+        self.assertEqual(
+            list(group.keys()),
+            ["bucket_start", "bucket_end_exclusive", "total_count",
+             "total_amount", "avg_amount"],
+        )
+        self.assertIsInstance(group["bucket_start"], int)
+        self.assertIsInstance(group["bucket_end_exclusive"], int)
+        self.assertIsInstance(group["total_amount"], str)
+        self.assertIsInstance(group["avg_amount"], str)
+
+    def test_each_transaction_enters_one_bucket(self):
+        result = self.idx.time_stats(
+            normalize_filters(), bucket_size=10, page_size=100
+        )
+        self.assertEqual(
+            sum(g["total_count"] for g in result["groups"]), 4
+        )
+
+    def test_closed_time_window_endpoints_fall_in_buckets(self):
+        # 时间窗左闭右闭：start=end=10 时 ts=10 必须计入 [10,20)
+        result = self.idx.time_stats(
+            normalize_filters(start_time=10, end_time=10), bucket_size=10
+        )
+        self.assertEqual(result["total_groups"], 1)
+        self.assertEqual(result["groups"][0]["bucket_start"], 10)
+        self.assertEqual(result["groups"][0]["total_count"], 1)
+
+    def test_pagination_no_skip_no_dup_no_reorder(self):
+        filters = normalize_filters()
+        all_starts = [
+            g["bucket_start"]
+            for g in self.idx.time_stats(
+                filters, bucket_size=10, page_size=100
+            )["groups"]
+        ]
+        collected = []
+        cursor = None
+        pages = 0
+        while True:
+            page = self.idx.time_stats(
+                filters, bucket_size=10, page_size=2, cursor=cursor
+            )
+            pages += 1
+            collected.extend(g["bucket_start"] for g in page["groups"])
+            self.assertEqual(page["total_groups"], 3)
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(pages, 2)  # 3 个区间、page_size=2：恰好 2 页
+        self.assertEqual(collected, all_starts)
+
+    def test_cursor_not_bound_to_page_size(self):
+        page1 = self.idx.time_stats(
+            normalize_filters(), bucket_size=10, page_size=2
+        )
+        rest = self.idx.time_stats(
+            normalize_filters(), bucket_size=10, page_size=100,
+            cursor=page1["next_cursor"],
+        )
+        self.assertEqual([g["bucket_start"] for g in rest["groups"]], [20])
+        self.assertIsNone(rest["next_cursor"])
+
+    def test_last_page_partial_returns_null_cursor(self):
+        page = self.idx.time_stats(
+            normalize_filters(), bucket_size=10, page_size=2
+        )
+        self.assertIsNotNone(page["next_cursor"])
+        last = self.idx.time_stats(
+            normalize_filters(), bucket_size=10, page_size=2,
+            cursor=page["next_cursor"],
+        )
+        self.assertEqual(len(last["groups"]), 1)
+        self.assertIsNone(last["next_cursor"])
+
+    def test_no_match(self):
+        result = self.idx.time_stats(
+            normalize_filters(method="nope"), bucket_size=10
+        )
+        self.assertEqual(result, {
+            "groups": [],
+            "total_groups": 0,
+            "next_cursor": None,
+        })
+
+    def test_filters_intersect_before_bucketing(self):
+        result = self.idx.time_stats(
+            normalize_filters(from_address=["nobody"]), bucket_size=10
+        )
+        self.assertEqual(result["groups"], [])
+
+    def test_invalid_bucket_size(self):
+        for bad in (0, -1, "10", 1.5, True, None):
+            with self.assertRaises(InvalidBucketSizeError):
+                self.idx.time_stats(normalize_filters(), bucket_size=bad)
+
+    def test_page_size_bounds(self):
+        with self.assertRaises(InvalidPageSizeError):
+            self.idx.time_stats(
+                normalize_filters(), bucket_size=10, page_size=0
+            )
+        with self.assertRaises(InvalidPageSizeError):
+            self.idx.time_stats(
+                normalize_filters(), bucket_size=10, page_size=1001
+            )
+        with self.assertRaises(InvalidPageSizeError):
+            self.idx.time_stats(
+                normalize_filters(), bucket_size=10, page_size="10"
+            )
+
+    def test_cursor_filter_mismatch(self):
+        page1 = self.idx.time_stats(
+            normalize_filters(), bucket_size=10, page_size=1
+        )
+        cursor = page1["next_cursor"]
+        with self.assertRaises(InvalidCursorError):
+            self.idx.time_stats(
+                normalize_filters(method="transfer"),
+                bucket_size=10, page_size=1, cursor=cursor,
+            )
+
+    def test_cursor_bucket_size_mismatch(self):
+        page1 = self.idx.time_stats(
+            normalize_filters(), bucket_size=10, page_size=1
+        )
+        with self.assertRaises(InvalidCursorError):
+            self.idx.time_stats(
+                normalize_filters(), bucket_size=20, page_size=1,
+                cursor=page1["next_cursor"],
+            )
+
+    def test_cursor_cross_command_rejected(self):
+        from tx_indexer.cursor import (
+            decode_address_stats_cursor,
+            decode_counterparty_stats_cursor,
+            decode_cursor,
+            decode_method_stats_cursor,
+            decode_time_stats_cursor,
+            encode_cursor,
+            encode_method_stats_cursor,
+            encode_time_stats_cursor,
+        )
+
+        filters = normalize_filters()
+        time_cursor = encode_time_stats_cursor(filters, 10, 0)
+        query_cursor = encode_cursor(filters, 1, "h1")
+        method_cursor = encode_method_stats_cursor(filters, 10, 1, "m")
+        with self.assertRaises(InvalidCursorError):
+            decode_cursor(time_cursor, filters)
+        with self.assertRaises(InvalidCursorError):
+            decode_method_stats_cursor(time_cursor, filters)
+        with self.assertRaises(InvalidCursorError):
+            decode_address_stats_cursor(time_cursor, filters)
+        with self.assertRaises(InvalidCursorError):
+            decode_counterparty_stats_cursor(time_cursor, filters)
+        with self.assertRaises(InvalidCursorError):
+            decode_time_stats_cursor(query_cursor, filters, 10)
+        with self.assertRaises(InvalidCursorError):
+            decode_time_stats_cursor(method_cursor, filters, 10)
+
+    def test_cursor_garbage(self):
+        for bad in ("", "not-base64!!!", "bm9wZQ", "%%%"):
+            with self.assertRaises(InvalidCursorError):
+                self.idx.time_stats(
+                    normalize_filters(), bucket_size=10, cursor=bad
+                )
+
+    def test_big_amounts_exact_decimal(self):
+        big = "123456789012345678901234567890"
+        idx = TxIndexer([rec("x", 1, 1, "a", "b", "m", big)])
+        group = idx.time_stats(
+            normalize_filters(), bucket_size=10
+        )["groups"][0]
         self.assertEqual(group["total_amount"], big)
         self.assertEqual(group["avg_amount"], big)
 

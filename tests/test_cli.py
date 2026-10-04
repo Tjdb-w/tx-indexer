@@ -694,5 +694,233 @@ class CliTest(unittest.TestCase):
         self.assertIsNone(payload["input_line"])
 
 
+    def test_time_stats(self):
+        # DATA_LINES 时间戳为 10、20、30；bucket-size 10 → 三个区间
+        code, page1, _ = self._run(
+            ["time-stats", self.path, "--bucket-size", "10",
+             "--page-size", "2"])
+        self.assertEqual(code, 0)
+        self.assertEqual(page1["total_groups"], 3)
+        self.assertEqual(page1["groups"], [
+            {"bucket_start": 10, "bucket_end_exclusive": 20,
+             "total_count": 1, "total_amount": "10", "avg_amount": "10"},
+            {"bucket_start": 20, "bucket_end_exclusive": 30,
+             "total_count": 1, "total_amount": "21", "avg_amount": "21"},
+        ])
+        self.assertIsNotNone(page1["next_cursor"])
+
+        code, page2, _ = self._run([
+            "time-stats", self.path, "--bucket-size", "10",
+            "--page-size", "2", "--cursor", page1["next_cursor"],
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(page2["groups"], [
+            {"bucket_start": 30, "bucket_end_exclusive": 40,
+             "total_count": 1, "total_amount": "5", "avg_amount": "5"},
+        ])
+        self.assertEqual(page2["total_groups"], 3)
+        self.assertIsNone(page2["next_cursor"])
+
+    def test_time_stats_walk_all_pages(self):
+        collected = []
+        cursor = None
+        while True:
+            argv = ["time-stats", self.path, "--bucket-size", "10",
+                    "--page-size", "1"]
+            if cursor is not None:
+                argv += ["--cursor", cursor]
+            code, page, _ = self._run(argv)
+            self.assertEqual(code, 0)
+            collected.extend(g["bucket_start"] for g in page["groups"])
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(collected, [10, 20, 30])
+
+    def test_time_stats_wider_bucket_aggregates(self):
+        code, page, _ = self._run(
+            ["time-stats", self.path, "--bucket-size", "100"])
+        self.assertEqual(code, 0)
+        # 三笔都在 [0,100)
+        self.assertEqual(page["total_groups"], 1)
+        self.assertEqual(page["groups"], [{
+            "bucket_start": 0,
+            "bucket_end_exclusive": 100,
+            "total_count": 3,
+            "total_amount": "36",
+            "avg_amount": "12",
+        }])
+        self.assertIsNone(page["next_cursor"])
+
+    def test_time_stats_default_page_size_is_100(self):
+        code, page, _ = self._run(
+            ["time-stats", self.path, "--bucket-size", "10"])
+        self.assertEqual(code, 0)
+        self.assertEqual(page["total_groups"], 3)
+        self.assertIsNone(page["next_cursor"])
+
+    def test_time_stats_no_match(self):
+        code, page, _ = self._run(
+            ["time-stats", self.path, "--bucket-size", "10",
+             "--method", "x"])
+        self.assertEqual(code, 0)
+        self.assertEqual(page, {
+            "groups": [],
+            "total_groups": 0,
+            "next_cursor": None,
+        })
+
+    def test_time_stats_closed_window_endpoint(self):
+        # 时间窗左闭右闭：--end-time 30 必须包含 ts=30 的 h3
+        code, page, _ = self._run([
+            "time-stats", self.path, "--bucket-size", "10",
+            "--start-time", "20", "--end-time", "30",
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [g["bucket_start"] for g in page["groups"]], [20, 30]
+        )
+
+    def test_time_stats_cursor_not_bound_to_page_size(self):
+        code, page1, _ = self._run(
+            ["time-stats", self.path, "--bucket-size", "10",
+             "--page-size", "1"])
+        self.assertEqual(code, 0)
+        code, rest, _ = self._run([
+            "time-stats", self.path, "--bucket-size", "10",
+            "--page-size", "100", "--cursor", page1["next_cursor"],
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [g["bucket_start"] for g in rest["groups"]], [20, 30]
+        )
+        self.assertIsNone(rest["next_cursor"])
+
+    def test_time_stats_cursor_bound_to_bucket_size(self):
+        code, page1, _ = self._run(
+            ["time-stats", self.path, "--bucket-size", "10",
+             "--page-size", "1"])
+        self.assertEqual(code, 0)
+        code, out, err = self._run([
+            "time-stats", self.path, "--bucket-size", "20",
+            "--page-size", "1", "--cursor", page1["next_cursor"],
+        ])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_cursor")
+        self.assertIsNone(payload["input_line"])
+
+    def test_time_stats_cursor_bound_to_filters(self):
+        code, page1, _ = self._run([
+            "time-stats", self.path, "--bucket-size", "10",
+            "--method", "transfer", "--page-size", "1"])
+        self.assertEqual(code, 0)
+        code, out, err = self._run([
+            "time-stats", self.path, "--bucket-size", "10",
+            "--method", "approve", "--page-size", "1",
+            "--cursor", page1["next_cursor"],
+        ])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_cursor")
+        self.assertIsNone(payload["input_line"])
+
+    def test_time_stats_cross_command_cursor_exit_2(self):
+        for source in ("query", "method-stats", "address-stats",
+                       "counterparty-stats"):
+            argv = [source, self.path, "--page-size", "1"]
+            if source == "counterparty-stats":
+                argv += ["--address", "alice"]
+            code, src_page, _ = self._run(argv)
+            self.assertEqual(code, 0)
+            code, out, err = self._run([
+                "time-stats", self.path, "--bucket-size", "10",
+                "--cursor", src_page["next_cursor"],
+            ])
+            self.assertEqual(code, 2)
+            self.assertIsNone(out)
+            payload = json.loads(err)
+            self.assertEqual(payload["error"], "invalid_cursor")
+            self.assertIsNone(payload["input_line"])
+
+        # 反向：time-stats 游标用于其他命令同样拒绝
+        code, ts_page, _ = self._run(
+            ["time-stats", self.path, "--bucket-size", "10",
+             "--page-size", "1"])
+        self.assertEqual(code, 0)
+        for target in ("query", "method-stats", "address-stats"):
+            code, out, err = self._run([
+                target, self.path, "--cursor", ts_page["next_cursor"],
+            ])
+            self.assertEqual(code, 2)
+            self.assertEqual(
+                json.loads(err)["error"], "invalid_cursor"
+            )
+
+    def test_time_stats_missing_bucket_size_exit_2_before_read(self):
+        # 数据文件不存在：若先读文件则不会是 invalid_bucket_size
+        missing = os.path.join(self.tmp.name, "missing.jsonl")
+        code, out, err = self._run(["time-stats", missing])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_bucket_size")
+        self.assertIsNone(payload["input_line"])
+
+    def test_time_stats_invalid_bucket_size_exit_2(self):
+        for value in ("0", "-10", "2.5", "abc", "10s", ""):
+            code, out, err = self._run(
+                ["time-stats", self.path, "--bucket-size", value])
+            self.assertEqual(code, 2, value)
+            self.assertIsNone(out)
+            payload = json.loads(err)
+            self.assertEqual(payload["error"], "invalid_bucket_size")
+            self.assertIsNone(payload["input_line"])
+
+    def test_time_stats_invalid_bucket_size_before_file_read(self):
+        missing = os.path.join(self.tmp.name, "missing.jsonl")
+        code, out, err = self._run(
+            ["time-stats", missing, "--bucket-size", "0"])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_bucket_size")
+        self.assertIsNone(payload["input_line"])
+
+    def test_time_stats_invalid_page_size_exit_2(self):
+        code, out, err = self._run(
+            ["time-stats", self.path, "--bucket-size", "10",
+             "--page-size", "5000"])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_page_size")
+        self.assertIsNone(payload["input_line"])
+
+    def test_time_stats_data_error_has_line_no(self):
+        bad = os.path.join(self.tmp.name, "bad_ts.jsonl")
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(DATA_LINES[0]) + "\n")
+            fh.write("{broken\n")
+        code, _, err = self._run(
+            ["time-stats", bad, "--bucket-size", "10"])
+        self.assertEqual(code, 2)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_transaction")
+        self.assertEqual(payload["input_line"], 2)
+
+    def test_time_stats_invalid_time_range_exit_2(self):
+        code, out, err = self._run([
+            "time-stats", self.path, "--bucket-size", "10",
+            "--start-time", "100", "--end-time", "1"])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_time_range")
+        self.assertIsNone(payload["input_line"])
+
+
 if __name__ == "__main__":
     unittest.main()

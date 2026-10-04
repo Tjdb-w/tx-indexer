@@ -55,6 +55,12 @@ class InvalidPageSizeError(TxIndexerError):
     error = "invalid_page_size"
 
 
+class InvalidBucketSizeError(TxIndexerError):
+    """bucket_size 缺失、不是整数或不大于 0。"""
+
+    error = "invalid_bucket_size"
+
+
 class InvalidCursorError(TxIndexerError):
     """游标非法（格式错误、解码失败）或与当前筛选不匹配。"""
 

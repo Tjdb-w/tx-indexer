@@ -1,5 +1,5 @@
 """命令行入口：``tx-indexer query`` / ``stats`` / ``method-stats`` /
-``address-stats`` / ``counterparty-stats``。
+``address-stats`` / ``counterparty-stats`` / ``time-stats``。
 
 用法：
     tx-indexer query <data.jsonl> [筛选与分页选项]
@@ -7,10 +7,11 @@
     tx-indexer method-stats <data.jsonl> [筛选与分页选项]
     tx-indexer address-stats <data.jsonl> [筛选与分页选项]
     tx-indexer counterparty-stats <data.jsonl> --address ADDR [筛选与分页选项]
+    tx-indexer time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
 
 领域错误（invalid_transaction / duplicate_transaction / invalid_time_range /
-invalid_page_size / invalid_cursor / invalid_filter）以 JSON 对象输出到
-stderr，退出码 2：
+invalid_page_size / invalid_bucket_size / invalid_cursor / invalid_filter）以
+JSON 对象输出到 stderr，退出码 2：
 
     {"error": "...", "message": "...", "input_line": 12}
 """
@@ -20,7 +21,12 @@ import json
 import sys
 
 from .engine import DEFAULT_PAGE_SIZE, TxIndexer, normalize_filters
-from .errors import InvalidFilterError, InvalidPageSizeError, TxIndexerError
+from .errors import (
+    InvalidBucketSizeError,
+    InvalidFilterError,
+    InvalidPageSizeError,
+    TxIndexerError,
+)
 from .loader import load_file
 
 
@@ -66,6 +72,22 @@ def _parse_page_size(value):
             "page_size 必须为 1 到 1000 之间的整数（默认 100）", None
         )
     # 范围校验交给引擎统一抛出 InvalidPageSizeError
+    return parsed
+
+
+def _parse_bucket_size(value):
+    # 缺失、非整数或不大于 0 统一报 invalid_bucket_size；
+    # 范围（> 0）校验提前在此完成，保证读取数据文件前报错
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise InvalidBucketSizeError(
+            "bucket_size 必须为大于 0 的整数秒", None
+        )
+    if parsed <= 0:
+        raise InvalidBucketSizeError(
+            "bucket_size 必须为大于 0 的整数秒", None
+        )
     return parsed
 
 
@@ -139,6 +161,25 @@ def build_parser():
         "--cursor", help="上一页返回的 next_cursor"
     )
 
+    time_stats_parser = subparsers.add_parser(
+        "time-stats",
+        help="按固定 UTC 秒区间分页汇总（返回 groups/total_groups/next_cursor）",
+    )
+    time_stats_parser.add_argument("file", help="JSON Lines 数据文件路径")
+    _add_filter_args(time_stats_parser)
+    time_stats_parser.add_argument(
+        "--bucket-size",
+        help="区间宽度（UTC 秒整数，大于 0），区间从 Unix 纪元对齐、左闭右开",
+    )
+    time_stats_parser.add_argument(
+        "--page-size",
+        default=str(DEFAULT_PAGE_SIZE),
+        help="每页区间数，1 到 1000，默认 100",
+    )
+    time_stats_parser.add_argument(
+        "--cursor", help="上一页返回的 next_cursor"
+    )
+
     return parser
 
 
@@ -173,13 +214,22 @@ def main(argv=None):
     try:
         filters = _filters_from_args(args, parser)
         page_size = None
+        bucket_size = None
         if args.command in (
             "query",
             "method-stats",
             "address-stats",
             "counterparty-stats",
+            "time-stats",
         ):
             page_size = _parse_page_size(args.page_size)
+        if args.command == "time-stats":
+            # 缺失 / 非整数 / 不大于 0 均在读取数据文件前报 invalid_bucket_size
+            if args.bucket_size is None:
+                raise InvalidBucketSizeError(
+                    "time-stats 必须指定 --bucket-size", None
+                )
+            bucket_size = _parse_bucket_size(args.bucket_size)
         if args.command == "counterparty-stats" and filters["address"] is None:
             # 缺少 --address 与空白值、address/from/to 冲突一样，
             # 都在读取数据文件前报 invalid_filter
@@ -206,6 +256,13 @@ def main(argv=None):
             result = indexer.counterparty_stats(
                 filters, page_size=page_size, cursor=args.cursor
             )
+        elif args.command == "time-stats":
+            result = indexer.time_stats(
+                filters,
+                bucket_size,
+                page_size=page_size,
+                cursor=args.cursor,
+            )
         else:
             result = indexer.stats(filters)
     except TxIndexerError as exc:
@@ -213,7 +270,7 @@ def main(argv=None):
         sys.stderr.write("\n")
         return 2
     except OSError as exc:
-        # 文件读取失败不属于五类领域错误，按普通 I/O 错误处理
+        # 文件读取失败不属于领域错误，按普通 I/O 错误处理
         sys.stderr.write("无法读取数据文件 %s：%s\n" % (args.file, exc))
         return 2
 

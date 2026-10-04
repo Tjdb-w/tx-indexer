@@ -30,6 +30,7 @@
 ./tx-indexer method-stats <data.jsonl> [选项]
 ./tx-indexer address-stats <data.jsonl> [选项]
 ./tx-indexer counterparty-stats <data.jsonl> --address ADDR [选项]
+./tx-indexer time-stats <data.jsonl> --bucket-size SECONDS [选项]
 ```
 
 也可以用 `python3 -m tx_indexer ...`。
@@ -44,10 +45,14 @@
 
 集合类选项（`--from-address` / `--to-address` / `--method`）重复给定相同值等同一个条件。筛选值为空或仅含空白、或 `--address` 与付款方/收款方筛选并用，会在读取数据文件前报 `invalid_filter`。
 
-`query`、`method-stats`、`address-stats` 与 `counterparty-stats` 额外选项：
+`query`、`method-stats`、`address-stats`、`counterparty-stats` 与 `time-stats` 额外选项：
 
 - `--page-size N`：每页条数，默认 `100`，范围 1..1000
 - `--cursor TOKEN`：上一页返回的 `next_cursor`
+
+`time-stats` 还要求：
+
+- `--bucket-size SECONDS`：区间宽度（正整数 UTC 秒），区间从 Unix 纪元对齐（`bucket_start = timestamp // bucket_size * bucket_size`）、左闭右开；缺失、非整数或不大于 0 时在读取数据文件前报 `invalid_bucket_size`
 
 ### query 返回
 
@@ -139,6 +144,27 @@
 - 末页 `next_cursor` 为 `null`。游标不透明且自校验，不绑定 `page-size`，只允许在相同命令及等价筛选条件下续用；跨命令复用或改变观察地址、筛选条件都会报 `invalid_cursor`。
 - 无匹配时：`address` 保留原值、`groups` 为 `[]`、`total_groups` 为 `0`、`next_cursor` 为 `null`。
 
+### time-stats 返回
+
+把匹配交易按固定宽度的 UTC 秒区间分桶。区间从 Unix 纪元对齐（`bucket_start = (timestamp // bucket_size) * bucket_size`）、左闭右开；时间窗本身仍左闭右闭，因此时间窗端点与区间边界都不会漏计或重复，每笔匹配交易只进入一个区间。只返回有交易的区间，按 `bucket_start` 升序分页：
+
+```json
+{
+  "groups": [
+    {"bucket_start": 0, "bucket_end_exclusive": 10, "total_count": 2, "total_amount": "7", "avg_amount": "3"},
+    {"bucket_start": 10, "bucket_end_exclusive": 20, "total_count": 1, "total_amount": "100", "avg_amount": "100"}
+  ],
+  "total_groups": 3,
+  "next_cursor": null
+}
+```
+
+- `bucket_start` / `bucket_end_exclusive` 为 UTC 秒整数（后者不属于本区间）；空区间不出现。
+- `total_count` 为该区间匹配交易数；金额均为十进制整数字符串，`avg_amount = total_amount // total_count` 向下取整。
+- `total_groups` 为全部非空区间数（不是当前页区间数）。
+- 末页 `next_cursor` 为 `null`。游标不透明且自校验，绑定 `time-stats` 命令、等价筛选与 `bucket_size`，但**不绑定** `page_size`；跨命令复用、改变筛选或 `bucket_size`、游标篡改或解码失败都会报 `invalid_cursor`。
+- 无匹配时：`groups` 为 `[]`、`total_groups` 为 `0`、`next_cursor` 为 `null`。
+
 ## 错误处理
 
 领域错误输出到 stderr（单行 JSON，含 `error`、`message`、`input_line`），退出码为 `2`。只有输入数据行错误才带 1 起始行号，其余错误 `input_line` 为 `null`。
@@ -149,7 +175,8 @@
 | `duplicate_transaction` | `tx_hash` 冲突（含冲突所在行号） |
 | `invalid_time_range` | 时间窗倒置（`start_time > end_time`） |
 | `invalid_page_size` | `page_size` 越界或无法解析 |
-| `invalid_cursor` | 游标非法（格式/解码错误）或与当前筛选不匹配 |
+| `invalid_bucket_size` | `bucket_size` 缺失、非整数或不大于 0（读取数据文件前报错） |
+| `invalid_cursor` | 游标非法（格式/解码错误）或与当前筛选、`bucket_size` 不匹配 |
 | `invalid_filter` | 筛选值为空白、`--address` 与 `--from-address` / `--to-address` 并用，或 counterparty-stats 缺少 `--address`（读取数据文件前报错） |
 
 ## 代码结构
@@ -157,10 +184,10 @@
 - `tx_indexer/loader.py`：JSON Lines 解析与校验
 - `tx_indexer/engine.py`：筛选、排序、keyset 游标分页、聚合
 - `tx_indexer/cursor.py`：不透明游标编解码（base64url）
-- `tx_indexer/errors.py`：六类异常
+- `tx_indexer/errors.py`：七类异常
 - `tx_indexer/cli.py`：命令行入口
 - `tests/`：unittest 测试（`python3 -m unittest discover -s tests`）
 
 ## 状态
 
-已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按参与地址分页汇总（address-stats）、按交易对手分页汇总（counterparty-stats）与六类异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选。
+已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按参与地址分页汇总（address-stats）、按交易对手分页汇总（counterparty-stats）、按固定 UTC 秒区间分页汇总（time-stats）与七类异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选。
