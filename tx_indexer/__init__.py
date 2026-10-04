@@ -20,6 +20,7 @@ from .importer import (
     BLOCK_CONFLICT,
     IMPORT_CURSOR_MISMATCH,
     INVALID_IMPORT_BATCH,
+    INVALID_REPLACEMENT_BATCH,
     TX_CONFLICT,
     IncrementalImporter,
 )
@@ -29,6 +30,7 @@ __all__ = [
     "DuplicateTransactionError",
     "IMPORT_CURSOR_MISMATCH",
     "INVALID_IMPORT_BATCH",
+    "INVALID_REPLACEMENT_BATCH",
     "IncrementalImporter",
     "InvalidCursorError",
     "InvalidFilterError",

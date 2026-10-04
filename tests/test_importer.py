@@ -3,13 +3,14 @@
 import json
 import unittest
 
-from tx_indexer.cursor import encode_cursor
+from tx_indexer.cursor import encode_cursor, encode_import_cursor
 from tx_indexer.engine import TxIndexer, normalize_filters
 from tx_indexer.errors import InvalidCursorError
 from tx_indexer.importer import (
     BLOCK_CONFLICT,
     IMPORT_CURSOR_MISMATCH,
     INVALID_IMPORT_BATCH,
+    INVALID_REPLACEMENT_BATCH,
     TX_CONFLICT,
     IncrementalImporter,
 )
@@ -524,6 +525,381 @@ class BlockConflictTest(unittest.TestCase):
         self.assertEqual(retry["status"], "ok")
         self.assertEqual(retry["skipped_count"], 2)
         self.assertEqual(importer.confirmed_block_height, 1)
+
+
+def replace_all_on(importer, start_block, blocks, cursor):
+    """执行链重组替换，断言成功并返回结果。"""
+    result = importer.replace_from(start_block, blocks, cursor)
+    assert result["status"] == "ok", result
+    return result
+
+
+class ReplaceFromResultTest(unittest.TestCase):
+    def setUp(self):
+        self.importer = IncrementalImporter()
+        self.batches = sample_batches()
+        self.cursor = import_all(self.importer, self.batches)[
+            "next_import_cursor"]
+
+    def reorg_blocks(self):
+        """从高度 2 重组：h3 区块哈希变化，h5 成为新区块 3。"""
+        return [
+            batch("chain-a", 2, "0xb2'", [
+                tx("h3", 2, "0xb2'", 100, "alice", "carol", "transfer",
+                   "30", "3", False),
+            ]),
+            batch("chain-a", 3, "0xb5", [
+                tx("h5", 3, "0xb5", 310, "carol", "dave", "transfer", "50",
+                   "5", True),
+            ]),
+        ]
+
+    def test_result_counts_and_confirmation(self):
+        result = replace_all_on(
+            self.importer, 2, self.reorg_blocks(), self.cursor
+        )
+        self.assertEqual(result["removed_block_count"], 2)
+        self.assertEqual(result["removed_transaction_count"], 2)
+        self.assertEqual(result["imported_block_count"], 2)
+        self.assertEqual(result["imported_count"], 2)
+        self.assertEqual(result["skipped_count"], 0)
+        self.assertEqual(result["confirmed_block_height"], 3)
+        self.assertEqual(result["confirmed_block_hash"], "0xb5")
+        self.assertEqual(self.importer.confirmed_block_height, 3)
+        self.assertEqual(self.importer.confirmed_block_hash, "0xb5")
+
+    def test_query_and_stats_observe_only_new_suffix(self):
+        replace_all_on(self.importer, 2, self.reorg_blocks(), self.cursor)
+        page = self.importer.indexer.query(normalize_filters())
+        # h1/h2 前缀保留，h4 随旧后缀消失，h3 沿用哈希但内容替换，h5 新增
+        self.assertEqual(hashes(page), ["h1", "h2", "h3", "h5"])
+        self.assertEqual(self.importer._by_hash["h3"]["block_hash"], "0xb2'")
+        stats = self.importer.indexer.stats(normalize_filters())
+        self.assertEqual(stats["total_count"], 4)
+        self.assertEqual(stats["total_amount"], "110")
+
+    def test_prefix_is_preserved(self):
+        result = replace_all_on(
+            self.importer, 3,
+            [batch("chain-a", 3, "0xb6", [
+                tx("h6", 3, "0xb6", 400, "dave", "erin", "transfer", "60",
+                   "6", True),
+            ])],
+            self.cursor,
+        )
+        self.assertEqual(result["removed_block_count"], 1)
+        self.assertEqual(result["removed_transaction_count"], 1)
+        page = self.importer.indexer.query(normalize_filters())
+        self.assertEqual(hashes(page), ["h1", "h2", "h3", "h6"])
+
+    def test_next_cursor_continues_to_import_batch(self):
+        replaced = replace_all_on(
+            self.importer, 2, self.reorg_blocks(), self.cursor
+        )
+        result = self.importer.import_batch(
+            batch("chain-a", 4, "0xb7", []),
+            cursor=replaced["next_import_cursor"],
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["confirmed_block_height"], 4)
+
+    def test_next_cursor_continues_to_another_replace(self):
+        replaced = replace_all_on(
+            self.importer, 2, self.reorg_blocks(), self.cursor
+        )
+        again = replace_all_on(
+            self.importer, 3,
+            [batch("chain-a", 3, "0xb8", [
+                tx("h8", 3, "0xb8", 500, "erin", "frank", "transfer", "80",
+                   "8", True),
+            ])],
+            replaced["next_import_cursor"],
+        )
+        self.assertEqual(again["confirmed_block_hash"], "0xb8")
+        page = self.importer.indexer.query(normalize_filters())
+        self.assertEqual(hashes(page), ["h1", "h2", "h3", "h8"])
+
+    def test_empty_new_tip_block_allowed(self):
+        result = replace_all_on(
+            self.importer, 3,
+            [batch("chain-a", 3, "0xb9", [])],
+            self.cursor,
+        )
+        self.assertEqual(result["removed_block_count"], 1)
+        self.assertEqual(result["removed_transaction_count"], 1)
+        self.assertEqual(result["imported_count"], 0)
+        self.assertEqual(result["confirmed_block_height"], 3)
+        self.assertEqual(result["confirmed_block_hash"], "0xb9")
+
+    def test_new_suffix_longer_than_old(self):
+        blocks = self.reorg_blocks() + [
+            batch("chain-a", 4, "0xb7", [
+                tx("h7", 4, "0xb7", 600, "frank", "grace", "transfer", "70",
+                   "7", True),
+            ]),
+        ]
+        result = replace_all_on(self.importer, 2, blocks, self.cursor)
+        self.assertEqual(result["removed_block_count"], 2)
+        self.assertEqual(result["imported_block_count"], 3)
+        self.assertEqual(result["confirmed_block_height"], 4)
+        page = self.importer.indexer.query(normalize_filters())
+        self.assertEqual(hashes(page), ["h1", "h2", "h3", "h5", "h7"])
+
+
+class ReplaceFromSkipTest(unittest.TestCase):
+    def test_identical_old_suffix_transaction_skipped(self):
+        importer = IncrementalImporter()
+        batches = sample_batches()
+        cursor = import_all(importer, batches)["next_import_cursor"]
+        # 高度 3 的内容与旧后缀完全一致（重排前先含 h3/h4），同时替换高度 2、3
+        blocks = [
+            batches[1],
+            batches[2],
+        ]
+        result = replace_all_on(importer, 2, blocks, cursor)
+        self.assertEqual(result["removed_block_count"], 2)
+        self.assertEqual(result["removed_transaction_count"], 0)
+        self.assertEqual(result["imported_count"], 0)
+        self.assertEqual(result["skipped_count"], 2)
+        stats = importer.indexer.stats(normalize_filters())
+        self.assertEqual(stats["total_count"], 4)
+
+    def test_same_hash_moved_to_new_block_is_replaced_not_skipped(self):
+        importer = IncrementalImporter()
+        batches = sample_batches()
+        cursor = import_all(importer, batches)["next_import_cursor"]
+        # h4 从高度 3 移动到新高度 2：旧后缀同名但字段变化，旧记录移除、
+        # 新记录导入，不视为冲突
+        blocks = [
+            batch("chain-a", 2, "0xc2", [
+                tx("h4", 2, "0xc2", 300, "bob", "dave", "transfer", "40",
+                   "4", True),
+            ]),
+        ]
+        result = replace_all_on(importer, 2, blocks, cursor)
+        self.assertEqual(result["removed_transaction_count"], 2)
+        self.assertEqual(result["imported_count"], 1)
+        self.assertEqual(result["skipped_count"], 0)
+        page = importer.indexer.query(normalize_filters())
+        self.assertEqual(hashes(page), ["h1", "h2", "h4"])
+        self.assertEqual(
+            [t["block_number"] for t in page["transactions"]
+             if t["tx_hash"] == "h4"],
+            [2],
+        )
+
+    def test_identical_duplicate_within_new_suffix_skipped(self):
+        importer = IncrementalImporter()
+        cursor = import_all(importer, sample_batches())["next_import_cursor"]
+        duplicate = tx("h9", 2, "0xd2", 100, "alice", "carol", "transfer",
+                       "9", "9", True)
+        blocks = [
+            batch("chain-a", 2, "0xd2", [duplicate, dict(duplicate)]),
+        ]
+        result = replace_all_on(importer, 2, blocks, cursor)
+        self.assertEqual(result["imported_count"], 1)
+        self.assertEqual(result["skipped_count"], 1)
+        stats = importer.indexer.stats(normalize_filters())
+        self.assertEqual(stats["total_count"], 3)
+
+
+class ReplaceFromInvalidBatchTest(unittest.TestCase):
+    def setUp(self):
+        self.importer = IncrementalImporter()
+        self.cursor = import_all(self.importer, sample_batches())[
+            "next_import_cursor"]
+
+    def assert_invalid(self, start_block, blocks, cursor=None):
+        result = self.importer.replace_from(
+            start_block, blocks, self.cursor if cursor is None else cursor
+        )
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["error_code"], INVALID_REPLACEMENT_BATCH)
+        self.assertIn("message", result)
+
+    def test_empty_blocks(self):
+        self.assert_invalid(2, [])
+
+    def test_blocks_not_a_list(self):
+        self.assert_invalid(2, {"chain_id": "chain-a"})
+
+    def test_start_block_not_int(self):
+        self.assert_invalid("2", [sample_batches()[1]])
+        self.assert_invalid(True, [sample_batches()[1]])
+
+    def test_first_height_must_equal_start_block(self):
+        self.assert_invalid(2, [sample_batches()[2]])
+
+    def test_non_contiguous_heights(self):
+        self.assert_invalid(
+            2, [sample_batches()[1], sample_batches()[2],
+                batch("chain-a", 5, "0xb5", [])]
+        )
+
+    def test_inconsistent_chain_id(self):
+        blocks = [
+            sample_batches()[1],
+            batch("chain-b", 3, "0xb3", [
+                tx("h4", 3, "0xb3", 300, "bob", "dave", "transfer", "40",
+                   "4", True),
+            ]),
+        ]
+        self.assert_invalid(2, blocks)
+
+    def test_bad_block_structure(self):
+        self.assert_invalid(2, [{"chain_id": "chain-a"}])
+
+    def test_bad_tx_block_relation(self):
+        bad = batch("chain-a", 2, "0xb2", [
+            tx("h3", 3, "0xb2", 100, "alice", "carol", "transfer", "30",
+               "3", False),
+        ])
+        self.assert_invalid(2, [bad])
+
+    def test_invalid_replace_leaves_state_unchanged(self):
+        self.assert_invalid(2, [sample_batches()[2]])
+        page = self.importer.indexer.query(normalize_filters())
+        self.assertEqual(hashes(page), ["h1", "h2", "h3", "h4"])
+        self.assertEqual(self.importer.confirmed_block_height, 3)
+        # 当前游标仍可用于另一次合法替换
+        result = replace_all_on(
+            self.importer, 3,
+            [batch("chain-a", 3, "0xbb", [
+                tx("h9", 3, "0xbb", 900, "a", "b", "transfer", "9", "9",
+                   True),
+            ])],
+            self.cursor,
+        )
+        self.assertEqual(result["status"], "ok")
+
+
+class ReplaceFromCursorTest(unittest.TestCase):
+    def setUp(self):
+        self.importer = IncrementalImporter()
+        self.cursor = import_all(self.importer, sample_batches())[
+            "next_import_cursor"]
+
+    def assert_mismatch(self, start_block, blocks, cursor):
+        result = self.importer.replace_from(start_block, blocks, cursor)
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["error_code"], IMPORT_CURSOR_MISMATCH)
+
+    def test_start_block_not_imported(self):
+        self.assert_mismatch(4, [batch("chain-a", 4, "0xb4", [])],
+                             self.cursor)
+        self.assert_mismatch(0, [batch("chain-a", 0, "0xb0", [])],
+                             self.cursor)
+
+    def test_missing_cursor(self):
+        self.assert_mismatch(2, [sample_batches()[1]], None)
+
+    def test_on_fresh_importer(self):
+        fresh = IncrementalImporter()
+        result = fresh.replace_from(1, [sample_batches()[0]], self.cursor)
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["error_code"], IMPORT_CURSOR_MISMATCH)
+
+    def test_stale_cursor_rejected(self):
+        # 高度 1 的游标（当前链尖已到高度 3）
+        stale = encode_import_cursor("chain-a", 1, "0xb1")
+        self.assert_mismatch(2, [sample_batches()[1]], stale)
+
+    def test_wrong_chain_rejected(self):
+        self.assert_mismatch(
+            2, [batch("chain-b", 2, "0xb2", [])], self.cursor
+        )
+
+    def test_malformed_cursor_rejected(self):
+        for bad in ("", "not-base64!!!", "eyJ2IjoxfQ"):
+            self.assert_mismatch(2, [sample_batches()[1]], bad)
+
+    def test_pagination_cursor_rejected(self):
+        page_cursor = encode_cursor(normalize_filters(), 1, "h2")
+        self.assert_mismatch(2, [sample_batches()[1]], page_cursor)
+
+    def test_mismatch_leaves_state_unchanged(self):
+        self.assert_mismatch(4, [batch("chain-a", 4, "0xb4", [])],
+                             self.cursor)
+        page = self.importer.indexer.query(normalize_filters())
+        self.assertEqual(hashes(page), ["h1", "h2", "h3", "h4"])
+        # 原游标仍可用于合法替换
+        result = replace_all_on(
+            self.importer, 3,
+            [batch("chain-a", 3, "0xbb", [
+                tx("h9", 3, "0xbb", 900, "a", "b", "transfer", "9", "9",
+                   True),
+            ])],
+            self.cursor,
+        )
+        self.assertEqual(result["status"], "ok")
+
+
+class ReplaceFromTxConflictTest(unittest.TestCase):
+    def test_conflict_with_prefix_rejected(self):
+        importer = IncrementalImporter()
+        cursor = import_all(importer, sample_batches())["next_import_cursor"]
+        # h1 属于保留前缀（高度 1），新后缀同哈希但 amount 变化
+        blocks = [
+            batch("chain-a", 2, "0xe2", [
+                tx("h1", 2, "0xe2", 10, "alice", "bob", "transfer", "99",
+                   "1", True),
+            ]),
+        ]
+        result = importer.replace_from(2, blocks, cursor)
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["error_code"], TX_CONFLICT)
+        # 索引未改变
+        page = importer.indexer.query(normalize_filters())
+        self.assertEqual(hashes(page), ["h1", "h2", "h3", "h4"])
+        self.assertEqual(page["transactions"][0]["amount"], "10")
+
+    def test_conflicting_duplicate_within_new_suffix_rejected(self):
+        importer = IncrementalImporter()
+        cursor = import_all(importer, sample_batches())["next_import_cursor"]
+        first = tx("h9", 2, "0xf2", 100, "alice", "carol", "transfer", "9",
+                   "9", True)
+        second = dict(first, amount="99")
+        result = importer.replace_from(
+            2, [batch("chain-a", 2, "0xf2", [first, second])], cursor
+        )
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["error_code"], TX_CONFLICT)
+
+    def test_old_suffix_same_hash_change_is_not_conflict(self):
+        importer = IncrementalImporter()
+        cursor = import_all(importer, sample_batches())["next_import_cursor"]
+        # h3 在旧后缀中，新后缀同哈希但内容变化：允许替换
+        blocks = [
+            batch("chain-a", 2, "0xg2", [
+                tx("h3", 2, "0xg2", 100, "alice", "zoe", "transfer", "300",
+                   "3", True),
+            ]),
+        ]
+        result = replace_all_on(importer, 2, blocks, cursor)
+        page = importer.indexer.query(normalize_filters())
+        h3 = [t for t in page["transactions"] if t["tx_hash"] == "h3"][0]
+        self.assertEqual(h3["to_address"], "zoe")
+        self.assertEqual(h3["amount"], "300")
+
+    def test_conflict_is_atomic(self):
+        importer = IncrementalImporter()
+        cursor = import_all(importer, sample_batches())["next_import_cursor"]
+        good = tx("h9", 2, "0xh2", 100, "a", "b", "transfer", "9", "9",
+                  True)
+        conflicting = tx("h1", 2, "0xh2", 10, "alice", "bob", "transfer",
+                         "99", "1", True)
+        result = importer.replace_from(
+            2, [batch("chain-a", 2, "0xh2", [good, conflicting])], cursor
+        )
+        self.assertEqual(result["error_code"], TX_CONFLICT)
+        page = importer.indexer.query(normalize_filters())
+        self.assertEqual(hashes(page), ["h1", "h2", "h3", "h4"])
+        # 原游标仍可重试合法替换
+        retry = replace_all_on(
+            importer, 2,
+            [batch("chain-a", 2, "0xh2", [good])], cursor
+        )
+        self.assertEqual(retry["imported_count"], 1)
 
 
 class PaginationStabilityTest(unittest.TestCase):

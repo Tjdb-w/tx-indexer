@@ -175,6 +175,15 @@ class TxIndexer:
         """
         self._records.extend(records)
 
+    def remove_records(self, records):
+        """按对象身份移除记录（链重组替换用），保持其余记录顺序。
+
+        以 ``is`` 身份比对移除，未列入 ``records`` 的记录内容与相对顺序
+        不变；移除后查询与聚合立即不再观察到被移除的记录。
+        """
+        doomed = set(map(id, records))
+        self._records = [r for r in self._records if id(r) not in doomed]
+
     def _matched(self, filters):
         matched = [r for r in self._records if _matches(r, filters)]
         matched.sort(key=lambda r: (r["block_number"], r["tx_hash"]))
