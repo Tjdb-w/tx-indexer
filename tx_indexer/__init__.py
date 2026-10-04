@@ -1,26 +1,41 @@
 """Tx Indexer：链上交易索引与查询引擎。
 
 公开接口：
-- errors：六类异常
+- errors：七类异常
 - engine：查询、游标分页、聚合统计
 - loader：JSON Lines 加载与校验
-- cli：命令行入口（tx-indexer query / stats / method-stats）
+- importer：增量交易导入与断点续传
+- cli：命令行入口（tx-indexer query / stats / method-stats 等）
 """
 
 from .errors import (
     DuplicateTransactionError,
+    InvalidBucketSizeError,
     InvalidCursorError,
     InvalidFilterError,
     InvalidPageSizeError,
     InvalidTimeRangeError,
     InvalidTransactionError,
 )
+from .importer import (
+    BLOCK_CONFLICT,
+    IMPORT_CURSOR_MISMATCH,
+    INVALID_IMPORT_BATCH,
+    TX_CONFLICT,
+    IncrementalImporter,
+)
 
 __all__ = [
     "DuplicateTransactionError",
+    "InvalidBucketSizeError",
     "InvalidCursorError",
     "InvalidFilterError",
     "InvalidPageSizeError",
     "InvalidTimeRangeError",
     "InvalidTransactionError",
+    "IncrementalImporter",
+    "INVALID_IMPORT_BATCH",
+    "IMPORT_CURSOR_MISMATCH",
+    "BLOCK_CONFLICT",
+    "TX_CONFLICT",
 ]

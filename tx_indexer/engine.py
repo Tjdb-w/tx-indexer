@@ -167,6 +167,15 @@ class TxIndexer:
         # 加载顺序保留；查询时统一排序，不修改入参列表语义
         self._records = list(records)
 
+    def add_records(self, records):
+        """把已校验记录追加到索引（供增量导入使用）。
+
+        只追加、不覆盖；查询与聚合在每次调用时基于当前全部记录重新
+        计算，因此追加完成后立即可被查询观察到，且分页游标、排序口径、
+        筛选与聚合语义均不受影响。
+        """
+        self._records.extend(records)
+
     def _matched(self, filters):
         matched = [r for r in self._records if _matches(r, filters)]
         matched.sort(key=lambda r: (r["block_number"], r["tx_hash"]))
