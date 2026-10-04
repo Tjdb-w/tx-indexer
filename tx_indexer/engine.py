@@ -175,6 +175,20 @@ class TxIndexer:
         """
         self._records.extend(records)
 
+    def replace_records(self, remove_hashes, records):
+        """删除指定 tx_hash 的记录后追加新记录（链重组替换用）。
+
+        仅删除 ``remove_hashes`` 中的记录，其余记录（含更低高度前缀
+        以及内容完全相同、被保留的旧记录）原样保留，再按给定顺序追加
+        新记录。替换后查询与全部统计入口立即只观察替换后的数据，排序
+        仍在查询时统一进行。
+        """
+        if remove_hashes:
+            self._records = [
+                r for r in self._records if r["tx_hash"] not in remove_hashes
+            ]
+        self._records.extend(records)
+
     def _matched(self, filters):
         matched = [r for r in self._records if _matches(r, filters)]
         matched.sort(key=lambda r: (r["block_number"], r["tx_hash"]))

@@ -28,8 +28,16 @@
   "confirmed_block_height", "confirmed_block_hash",
   "next_import_cursor"}``
 - 拒绝：``{"status": "rejected", "error_code", "message"}``，
-  ``error_code`` 为 ``INVALID_IMPORT_BATCH`` / ``IMPORT_CURSOR_MISMATCH``
-  / ``TX_CONFLICT`` / ``BLOCK_CONFLICT`` 之一，且索引不产生任何新增数据
+  ``error_code`` 为 ``INVALID_IMPORT_BATCH`` / ``INVALID_REPLACEMENT_BATCH``
+  / ``IMPORT_CURSOR_MISMATCH`` / ``TX_CONFLICT`` / ``BLOCK_CONFLICT`` 之一，
+  且索引不产生任何新增数据
+
+链重组：:meth:`IncrementalImporter.replace_from` 在已导入的某一高度上
+原子覆盖从该高度到链尖的整个旧后缀，保留更低高度的前缀。它先完整校验
+新后缀（结构、连续性、链标识、交易冲突），全部通过后才替换，失败时
+索引保持原状。新后缀与保留前缀（或新后缀内部）同名交易字段不一致报
+``TX_CONFLICT``；旧后缀同名交易不参与冲突判定，其中完全相同的重复项
+保留并计入 ``skipped_count``，字段不同或被截掉的旧记录才删除。
 """
 
 from .cursor import decode_import_cursor, encode_import_cursor
@@ -39,6 +47,8 @@ from .loader import _AMOUNT_RE, _is_nonneg_int, _is_nonempty_text
 
 #: 批次结构非法（缺字段、类型错误或交易与批次声明的区块不一致）
 INVALID_IMPORT_BATCH = "INVALID_IMPORT_BATCH"
+#: replace_from 的替换批次结构非法（空批、区块结构/连续性/chain_id/交易关系非法）
+INVALID_REPLACEMENT_BATCH = "INVALID_REPLACEMENT_BATCH"
 #: 游标缺失/非法/与当前状态不一致，或起始区块高度无法无缝续接
 IMPORT_CURSOR_MISMATCH = "IMPORT_CURSOR_MISMATCH"
 #: 交易哈希已存在且任一决定查询结果的字段不同
@@ -156,6 +166,50 @@ def _validate_batch(batch):
 def _conflicts(existing, tx):
     """已存在记录与新交易在决定查询结果的字段上是否不一致。"""
     return any(existing[name] != tx[name] for name in _CONFLICT_FIELDS)
+
+
+def _validate_replacement(start_block, blocks):
+    """校验 replace_from 的新后缀（区块批次数组）。
+
+    成功返回 ``[(chain_id, height, block_hash, transactions), ...]``
+    （交易已按原顺序归一化为固定字段字典，高度连续升序）；失败返回
+    错误消息字符串。
+    """
+    if not _is_nonneg_int(start_block):
+        return "start_block 必须为非负整数"
+    if not isinstance(blocks, list):
+        return "blocks 必须为批次数组"
+    if len(blocks) == 0:
+        return "blocks 不能为空：替换后缀至少包含一个区块"
+
+    validated = []
+    for index, raw in enumerate(blocks):
+        result = _validate_batch(raw)
+        if isinstance(result, str):
+            return "blocks[%d]：%s" % (index, result)
+        validated.append(result)
+
+    chain_id, first_height, _, _ = validated[0]
+    if first_height != start_block:
+        return (
+            "blocks[0].start_block 为 %d，必须等于 start_block 参数 %d"
+            % (first_height, start_block)
+        )
+
+    expected = first_height
+    for index, (cid, height, _, _) in enumerate(validated):
+        if cid != chain_id:
+            return (
+                "blocks[%d] chain_id 为 %s，与首个区块的 %s 不一致"
+                % (index, cid, chain_id)
+            )
+        if index > 0 and height != expected:
+            return (
+                "blocks[%d] 高度 %d 不连续，期望高度 %d"
+                % (index, height, expected)
+            )
+        expected = height + 1
+    return validated
 
 
 class IncrementalImporter:
@@ -301,6 +355,149 @@ class IncrementalImporter:
         return {
             "status": "ok",
             "imported_count": len(imported),
+            "skipped_count": skipped,
+            "confirmed_block_height": self._confirmed_height,
+            "confirmed_block_hash": self._confirmed_hash,
+            "next_import_cursor": encode_import_cursor(
+                self._chain_id, self._confirmed_height, self._confirmed_hash
+            ),
+        }
+
+    def replace_from(self, start_block, blocks, cursor):
+        """链重组：原子覆盖 ``start_block`` 至链尖的旧后缀。
+
+        ``blocks`` 为非空的 import_batch 批次数组，首个批次的
+        ``start_block`` 必须等于参数值，高度连续、chain_id 一致。
+        保留更低高度的前缀；新后缀先完整校验（结构、游标、与保留前缀
+        及后缀内部的交易冲突），全部通过后才替换，失败时索引不变。
+
+        旧后缀同名交易不参与冲突判定：决定字段完全相同的保留并计入
+        skipped，字段不同或新后缀不再包含的旧记录才删除。
+        """
+        # 1. 新后缀结构校验：任何结构问题都先于状态/游标检查拒绝
+        validated = _validate_replacement(start_block, blocks)
+        if isinstance(validated, str):
+            return _rejected(INVALID_REPLACEMENT_BATCH, validated)
+        chain_id = validated[0][0]
+
+        # 2. 游标、链标识与起始高度校验
+        if self._chain_id is None or cursor is None:
+            return _rejected(
+                IMPORT_CURSOR_MISMATCH,
+                "replace_from 要求已导入数据且携带当前导入游标",
+            )
+        try:
+            saved = decode_import_cursor(cursor)
+        except TxIndexerError:
+            return _rejected(
+                IMPORT_CURSOR_MISMATCH, "导入游标无法解码或非法"
+            )
+        current = (self._chain_id, self._confirmed_height,
+                   self._confirmed_hash)
+        if saved != current:
+            return _rejected(
+                IMPORT_CURSOR_MISMATCH,
+                "导入游标与当前已确认状态不一致",
+            )
+        if chain_id != self._chain_id:
+            return _rejected(
+                IMPORT_CURSOR_MISMATCH,
+                "替换批次 chain_id 与已导入链不一致",
+            )
+        if self._blocks.get(start_block) is None:
+            return _rejected(
+                IMPORT_CURSOR_MISMATCH,
+                "start_block %d 不是已导入高度" % start_block,
+            )
+
+        old_tip = self._confirmed_height
+
+        # 3. 交易级冲突校验：仅对照保留前缀与新后缀内部；
+        #    旧后缀同名交易先删除，不参与冲突判定。
+        prefix = {
+            h: tx for h, tx in self._by_hash.items()
+            if tx["block_number"] < start_block
+        }
+        seen_in_suffix = {}
+        for _, _, _, txs in validated:
+            for tx in txs:
+                tx_hash = tx["tx_hash"]
+                existing = prefix.get(tx_hash)
+                if existing is None:
+                    existing = seen_in_suffix.get(tx_hash)
+                if existing is not None and _conflicts(existing, tx):
+                    return _rejected(
+                        TX_CONFLICT,
+                        "tx_hash %s 与保留数据同名交易的决定字段不一致"
+                        % tx_hash,
+                    )
+                seen_in_suffix.setdefault(tx_hash, tx)
+
+        # 4. 全部校验通过，原子替换。旧后缀同名交易分两类：决定字段完全
+        #    相同的重复项原样保留、计入 skipped；字段不同或新后缀不再包含
+        #    的旧记录才真正删除。保留前缀与新后缀内部的相同重复项同理跳过。
+        old_suffix = {
+            h: tx for h, tx in self._by_hash.items()
+            if start_block <= tx["block_number"] <= old_tip
+        }
+
+        remove_hashes = set()
+        retained_hashes = set()
+        imported_records = []
+        imported_hashes = set()
+        skipped = 0
+        for _, _, _, txs in validated:
+            for tx in txs:
+                tx_hash = tx["tx_hash"]
+                if tx_hash in imported_hashes:
+                    # 新后缀内部先前已写入的相同重复项（校验已排除字段冲突）
+                    skipped += 1
+                    continue
+                old = old_suffix.get(tx_hash)
+                if old is not None and not _conflicts(old, tx):
+                    # 旧后缀同名交易且决定字段完全一致：保留、跳过
+                    retained_hashes.add(tx_hash)
+                    skipped += 1
+                    continue
+                if old is not None:
+                    # 旧后缀同名交易但字段不同（重组）：删除旧记录后写入
+                    remove_hashes.add(tx_hash)
+                imported_hashes.add(tx_hash)
+                imported_records.append(tx)
+        # 新后缀不再包含的旧记录一律删除
+        for tx_hash in old_suffix:
+            if tx_hash not in retained_hashes and tx_hash not in imported_hashes:
+                remove_hashes.add(tx_hash)
+
+        removed_block_count = old_tip - start_block + 1
+        removed_transaction_count = len(remove_hashes)
+
+        self._indexer.replace_records(remove_hashes, imported_records)
+
+        # 元数据：删除旧后缀区块、登记新区块
+        for height in range(start_block, old_tip + 1):
+            self._blocks.pop(height, None)
+        for _, height, block_hash, txs in validated:
+            self._blocks[height] = {
+                "block_hash": block_hash,
+                "tx_hashes": frozenset(tx["tx_hash"] for tx in txs),
+            }
+        # 交易哈希表：删除被替换的旧记录，写入新记录；保留记录不动
+        for tx_hash in remove_hashes:
+            self._by_hash.pop(tx_hash, None)
+        for tx in imported_records:
+            self._by_hash[tx["tx_hash"]] = tx
+
+        last = validated[-1]
+        self._confirmed_height = last[1]
+        self._confirmed_hash = last[2]
+
+        return {
+            "status": "ok",
+            "removed_block_count": removed_block_count,
+            "removed_transaction_count": removed_transaction_count,
+            "imported_block_count": len(validated),
+            "imported_count": len(imported_records),
             "skipped_count": skipped,
             "confirmed_block_height": self._confirmed_height,
             "confirmed_block_hash": self._confirmed_hash,

@@ -270,6 +270,50 @@ indexer = importer.indexer                        # 底层 TxIndexer，可直接
 | `TX_CONFLICT` | 交易哈希已存在且任一决定查询结果的字段不同 |
 | `BLOCK_CONFLICT` | 已导入高度上的区块哈希不同，或同一区块哈希对应的交易集合发生变化 |
 
+### 链重组替换（replace_from）
+
+链重组时，已确认的高高度区块可能需要整段替换。`replace_from(start_block, blocks, cursor)` 在**已导入的某一高度**上原子覆盖从该高度到链尖的整个旧后缀，同时保留更低高度的前缀：先完整校验新后缀，全部通过后才替换，任何失败都不改变索引。
+
+```python
+result = importer.replace_from(
+    start_block,      # 已导入的高度
+    blocks,           # 非空 import_batch 批次数组（新后缀）
+    cursor,           # 当前 next_import_cursor
+)
+```
+
+`blocks` 是普通 import_batch 批次（含 `chain_id`、`start_block`、`block_hash`、`transactions`，交易字段规则相同）组成的非空数组：首个批次的 `start_block` 必须等于 `start_block` 参数，区块高度连续（+1）、`chain_id` 一致，每笔交易的 `block_number`、`block_hash` 与其所属批次一致。新后缀可以比旧后缀更短（链尖回缩），也可以更长。
+
+冲突与计数口径：
+
+- 新后缀的 `tx_hash` 与**保留前缀**或**新后缀内部**的同名交易在任一决定字段（区块、时间、地址、方法、金额、费用、成功状态）上不一致 → `TX_CONFLICT`，整次替换拒绝、索引不变。
+- **旧后缀**中的同名交易一律先替换、**不参与冲突判定**：决定字段完全相同的旧记录原样保留并计入 `skipped_count`；字段不同的旧记录删除后写入新记录；新后缀不再包含的旧记录直接删除。
+- 新后缀内部完全相同的重复项同样跳过并计入 `skipped_count`。
+
+成功返回（计数字段区分「删除的旧区块/旧交易」「写入的新区块/新交易」四种数量，确认字段给出新链尖）：
+
+```json
+{
+  "status": "ok",
+  "removed_block_count": 2,
+  "removed_transaction_count": 2,
+  "imported_block_count": 2,
+  "imported_count": 2,
+  "skipped_count": 0,
+  "confirmed_block_height": 3,
+  "confirmed_block_hash": "0xc3",
+  "next_import_cursor": "eyJ..."
+}
+```
+
+成功后 `importer.indexer` 的 query 与全部统计入口只观察新数据，旧后缀数据不再可见。返回的 `next_import_cursor` 绑定新链状态，可续用于 `import_batch`（在新链尖 +1 处追加）或再次 `replace_from`，且与分页游标相互独立、不能混用。
+
+| error_code | 触发条件 |
+| --- | --- |
+| `INVALID_REPLACEMENT_BATCH` | `blocks` 为空或不是数组；区块结构非法、高度不连续、`chain_id` 不一致，或交易与所属区块的关系非法 |
+| `IMPORT_CURSOR_MISMATCH` | `start_block` 不是已导入高度；游标缺失/非法/不是当前导入游标，或误用了分页游标；替换批次 `chain_id` 与已导入链不同 |
+| `TX_CONFLICT` | 新后缀交易与保留前缀或新后缀内部同名交易的决定字段不一致 |
+
 ## 错误处理
 
 领域错误输出到 stderr（单行 JSON，含 `error`、`message`、`input_line`），退出码为 `2`。只有输入数据行错误才带 1 起始行号，其余错误 `input_line` 为 `null`。
@@ -296,4 +340,4 @@ indexer = importer.indexer                        # 底层 TxIndexer，可直接
 
 ## 状态
 
-已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按参与地址分页汇总（address-stats）、按交易对手分页汇总（counterparty-stats）、按固定宽度时间区间分页汇总（time-stats）、按有向交易对分页汇总（pair-stats）、按时间区间 × 参与地址分页汇总（address-time-stats）与七类异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选；增量交易导入与断点续传（原子批次、重试判重、四类机器可读拒绝码、独立导入游标）。
+已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按参与地址分页汇总（address-stats）、按交易对手分页汇总（counterparty-stats）、按固定宽度时间区间分页汇总（time-stats）、按有向交易对分页汇总（pair-stats）、按时间区间 × 参与地址分页汇总（address-time-stats）与七类异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选；增量交易导入与断点续传（原子批次、重试判重、四类机器可读拒绝码、独立导入游标）；链重组后缀替换（`replace_from`，原子覆盖已导入高度至链尖、保留更低前缀、旧后缀同名不冲突、四类计数字段与 `INVALID_REPLACEMENT_BATCH` 拒绝码）。
