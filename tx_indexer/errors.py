@@ -4,7 +4,6 @@
 由输入数据行引起的错误还携带 ``input_line``（1 起始行号），其余错误为 None。
 """
 
-
 class TxIndexerError(Exception):
     """所有 Tx Indexer 错误的基类。"""
 
@@ -65,3 +64,15 @@ class InvalidBucketSizeError(TxIndexerError):
     """bucket_size 缺失、无法解析为整数或不大于 0。"""
 
     error = "invalid_bucket_size"
+
+
+class SourceUnavailableError(TxIndexerError):
+    """上游数据源暂时无法返回指定区块。"""
+
+    error = "source_unavailable"
+
+
+class TransactionConflictError(TxIndexerError):
+    """相同交易哈希出现不同的区块高度、时间、地址或方法标识。"""
+
+    error = "transaction_conflict"

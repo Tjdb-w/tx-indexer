@@ -314,6 +314,40 @@ result = importer.replace_from(
 | `IMPORT_CURSOR_MISMATCH` | `start_block` 不是已导入高度；游标缺失/非法/不是当前导入游标，或误用了分页游标；替换批次 `chain_id` 与已导入链不同 |
 | `TX_CONFLICT` | 新后缀交易与保留前缀或新后缀内部同名交易的决定字段不一致 |
 
+## 索引水位与幂等重放
+
+`tx_indexer.watermark.WatermarkIndexer` 在查询索引之上提供按链的索引水位与幂等重放：同一段链上历史可以被安全地重复提交，网络中断后也能从确定位置继续。与查询共享同一份内存存储，批次提交成功后查询与聚合立即观察到本批全部交易；已有查询、聚合与分页游标行为不受影响。
+
+```python
+from tx_indexer.watermark import WatermarkIndexer
+
+indexer = WatermarkIndexer(source=source)   # source(chain_id, height) 取块
+result = indexer.commit_range("chain-a", 0, 100, 10)   # 提交 0..100，每批 10 块
+status = indexer.status("chain-a")                     # 只读状态
+engine = indexer.indexer                               # 底层 TxIndexer，可直接查询
+```
+
+`commit_range(chain_id, start_block, end_block, batch_size, source=None)` 按起始区块升序到结束区块的顺序逐批处理：每个批次先校验并标准化交易，再把交易原子地写入现有索引，最后推进该链的已提交水位。标准化结果保留交易哈希、区块高度、区块时间、发起地址、接收地址和方法标识（另保留 `amount`，缺省 `"0"`，用于维持既有查询与聚合口径）。批次只在整批成功后提交，中途失败不会留下半批结果。
+
+- 参数非法（起始区块大于结束区块、起始/结束区块小于零、批量大小不在 1..1000）抛 `ValueError`。
+- 上游暂时无法返回指定区块（数据源返回 `None` 或抛异常）抛 `SourceUnavailableError`；已完整提交的前序批次和水位保持有效，下一次可以原样重放未完成范围。
+- 相同交易哈希与相同标准化内容再次出现时视为重复：不新增记录，也不改变首次写入结果。相同交易哈希却出现不同区块高度、时间、地址或方法标识时抛 `TransactionConflictError`，并停止当前批次，不推进到冲突交易所在批次的水位。
+- 并发提交同一链时按链串行：相同范围合并为幂等结果；不同范围不能越过尚未提交的低区块形成更高水位，后到请求等待前一范围完成后继续，最终水位始终覆盖连续已提交区间。
+
+`status(chain_id, start_block=None)` 为只读入口，不扫描交易明细，也不改变索引，返回：
+
+```json
+{
+  "chain_id": "chain-a",
+  "committed_start_block": 0,
+  "committed_end_block": 100,
+  "next_block": 101,
+  "last_batch_time": 1759600000.0
+}
+```
+
+尚未开始索引的链返回已提交区间为空（`committed_start_block` / `committed_end_block` 为 `null`），`next_block` 等于本次传入的起始区块或该链已配置的起始区块（构造时 `start_blocks` 参数），`last_batch_time` 为 `null`。
+
 ## 错误处理
 
 领域错误输出到 stderr（单行 JSON，含 `error`、`message`、`input_line`），退出码为 `2`。只有输入数据行错误才带 1 起始行号，其余错误 `input_line` 为 `null`。
@@ -334,10 +368,11 @@ result = importer.replace_from(
 - `tx_indexer/engine.py`：筛选、排序、keyset 游标分页、聚合
 - `tx_indexer/cursor.py`：不透明游标编解码（base64url），含独立的导入游标
 - `tx_indexer/importer.py`：增量交易导入与断点续传
-- `tx_indexer/errors.py`：七类异常
+- `tx_indexer/watermark.py`：索引水位与幂等重放
+- `tx_indexer/errors.py`：九类异常
 - `tx_indexer/cli.py`：命令行入口
 - `tests/`：unittest 测试（`python3 -m unittest discover -s tests`）
 
 ## 状态
 
-已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按参与地址分页汇总（address-stats）、按交易对手分页汇总（counterparty-stats）、按固定宽度时间区间分页汇总（time-stats）、按有向交易对分页汇总（pair-stats）、按时间区间 × 参与地址分页汇总（address-time-stats）与七类异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选；增量交易导入与断点续传（原子批次、重试判重、四类机器可读拒绝码、独立导入游标）；链重组后缀替换（`replace_from`，原子覆盖已导入高度至链尖、保留更低前缀、旧后缀同名不冲突、四类计数字段与 `INVALID_REPLACEMENT_BATCH` 拒绝码）。
+已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按参与地址分页汇总（address-stats）、按交易对手分页汇总（counterparty-stats）、按固定宽度时间区间分页汇总（time-stats）、按有向交易对分页汇总（pair-stats）、按时间区间 × 参与地址分页汇总（address-time-stats）与九类异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选；增量交易导入与断点续传（原子批次、重试判重、四类机器可读拒绝码、独立导入游标）；链重组后缀替换（`replace_from`，原子覆盖已导入高度至链尖、保留更低前缀、旧后缀同名不冲突、四类计数字段与 `INVALID_REPLACEMENT_BATCH` 拒绝码）；索引水位与幂等重放（`WatermarkIndexer`，按链连续水位、原子批次、`SourceUnavailableError` / `TransactionConflictError`、只读状态入口、按链串行的并发合并）。
