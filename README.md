@@ -429,6 +429,43 @@ indexer = manager.indexer             # 底层 TxIndexer，提交成功后立即
 新功能启用后，单次查询、全部聚合统计与分页游标继续返回原有格式、
 过滤语义、排序和兼容结果。
 
+### 多链共用入口：MultiChainReplayManager
+
+`MultiChainReplayManager` 在多个 `chain_id` 共用同一入口时按链隔离
+交易身份、索引、水位和游标，`submit` / `status` 的参数、分批、原子
+提交、冲突、断点续传与同链并发语义与 `ReplayManager` 完全一致：
+
+```python
+from tx_indexer import MultiChainReplayManager
+
+manager = MultiChainReplayManager(fetch_blocks)  # fetch_blocks 也可在每次 submit 时覆盖
+manager.submit("chain-a", 0, 99, batch_size=10)
+manager.submit("chain-b", 0, 49, batch_size=10)  # 异链独立，不互相阻塞
+
+page = manager.query("chain-a", normalize_filters(method="transfer"),
+                     page_size=100, cursor=None)
+summary = manager.stats("chain-b", normalize_filters(start_time=0, end_time=9999))
+```
+
+与 `ReplayManager` 的区别仅在隔离粒度：
+
+- 相同 `tx_hash` 在不同 `chain_id` 中属于不同交易：区块内容与查询结果
+  按链独立，跨链同哈希不判重、也不冲突；同链仍保持首次写入不覆盖、
+  同哈希不同标准化内容抛 `TransactionConflictError`。
+- 每条链拥有独立索引，`query` / `stats` 的筛选、左闭右闭时间窗、
+  排序、返回字段与汇总口径与 `TxIndexer` 一致。
+- `query` 游标绑定 query 命令、`chain_id` 与等价筛选：跨链复用、改换
+  筛选或与其它命令（各 stats、增量导入）游标混用都抛
+  `InvalidCursorError`；`page_size` 非法抛 `InvalidPageSizeError`，
+  筛选非法抛 `InvalidFilterError` / `InvalidTimeRangeError`。
+- 尚未开始索引的链：`query` 返回
+  `{"transactions": [], "total": 0, "next_cursor": null}`，`stats`
+  返回无匹配结果（`total_count` 为 0、`total_amount` 为 `"0"`），
+  均不创建链、不改变状态。
+- 构造函数与 `submit` 最终都没有可调用的 `fetch_blocks` 时抛
+  `ValueError`；`chain_id` 空白、非法区块范围、非法 `batch_size`
+  的校验与 `ReplayManager` 一致。
+
 ## 错误处理
 
 领域错误输出到 stderr（单行 JSON，含 `error`、`message`、`input_line`），退出码为 `2`。只有输入数据行错误才带 1 起始行号，其余错误 `input_line` 为 `null`。
@@ -458,11 +495,11 @@ indexer = manager.indexer             # 底层 TxIndexer，提交成功后立即
 - `tx_indexer/engine.py`：筛选、排序、keyset 游标分页、聚合
 - `tx_indexer/cursor.py`：不透明游标编解码（base64url），含独立的导入游标
 - `tx_indexer/importer.py`：增量交易导入与断点续传
-- `tx_indexer/replay.py`：索引水位与幂等重放（按链水位、原子批次、并发串行化）
+- `tx_indexer/replay.py`：索引水位与幂等重放（按链水位、原子批次、并发串行化）；`ReplayManager` 为跨链共享索引/全局 tx_hash 身份，`MultiChainReplayManager` 按链隔离身份、索引、水位与查询游标
 - `tx_indexer/errors.py`：异常类型
 - `tx_indexer/cli.py`：命令行入口
 - `tests/`：unittest 测试（`python3 -m unittest discover -s tests`）
 
 ## 状态
 
-已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按参与地址分页汇总（address-stats）、按交易对手分页汇总（counterparty-stats）、按固定宽度时间区间分页汇总（time-stats）、按有向交易对分页汇总（pair-stats）、按时间区间 × 参与地址分页汇总（address-time-stats）与领域异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选；增量交易导入与断点续传（原子批次、重试判重、四类机器可读拒绝码、独立导入游标）；链重组后缀替换（`replace_from`，原子覆盖已导入高度至链尖、保留更低前缀、旧后缀同名不冲突、四类计数字段与 `INVALID_REPLACEMENT_BATCH` 拒绝码）；索引水位与幂等重放（`ReplayManager.submit` / `status`：按链连续水位、升序分批、整批原子提交、重复跳过、`TransactionConflictError` 冲突停止、`SourceUnavailableError` 断点续传、同链并发合并/等待、不扫描明细的只读状态入口）。
+已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按参与地址分页汇总（address-stats）、按交易对手分页汇总（counterparty-stats）、按固定宽度时间区间分页汇总（time-stats）、按有向交易对分页汇总（pair-stats）、按时间区间 × 参与地址分页汇总（address-time-stats）与领域异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选；增量交易导入与断点续传（原子批次、重试判重、四类机器可读拒绝码、独立导入游标）；链重组后缀替换（`replace_from`，原子覆盖已导入高度至链尖、保留更低前缀、旧后缀同名不冲突、四类计数字段与 `INVALID_REPLACEMENT_BATCH` 拒绝码）；索引水位与幂等重放（`ReplayManager.submit` / `status`：按链连续水位、升序分批、整批原子提交、重复跳过、`TransactionConflictError` 冲突停止、`SourceUnavailableError` 断点续传、同链并发合并/等待、不扫描明细的只读状态入口）；多链按链隔离（`MultiChainReplayManager`：按 `(chain_id, tx_hash)` 隔离身份、独立索引与水位、按链 `query`/`stats`、绑定链与等价筛选的查询游标）。
