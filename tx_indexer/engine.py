@@ -16,6 +16,9 @@ counterparty-stats 排序键与 address-stats 相同，末级改为 counterparty
 to_address，接收方为观察地址时归 from_address，自转账归观察地址本身）。
 time-stats 把匹配交易按从 Unix 纪元对齐、左闭右开的固定宽度时间区间
 分桶，只返回非空区间，按 bucket_start 升序分页。
+pair-stats 把匹配交易按 from_address 到 to_address 的原字符串有向
+组合分组（自转账也累计一次），按 total_amount 降序、total_count
+降序、from_address 码点升序、to_address 码点升序分页。
 分页：不透明 keyset 游标（见 :mod:`tx_indexer.cursor`），相同命令与
 筛选下不跳过、不重复、不乱序；``total`` / ``total_groups`` 始终为
 全部匹配数 / 全部分组数。
@@ -28,11 +31,13 @@ from .cursor import (
     decode_counterparty_stats_cursor,
     decode_cursor,
     decode_method_stats_cursor,
+    decode_pair_stats_cursor,
     decode_time_stats_cursor,
     encode_address_stats_cursor,
     encode_counterparty_stats_cursor,
     encode_cursor,
     encode_method_stats_cursor,
+    encode_pair_stats_cursor,
     encode_time_stats_cursor,
 )
 from .errors import (
@@ -640,6 +645,82 @@ class TxIndexer:
         if end < total_groups:
             next_cursor = encode_time_stats_cursor(
                 filters, bucket_size, page_starts[-1]
+            )
+        else:
+            next_cursor = None
+
+        return {
+            "groups": groups,
+            "total_groups": total_groups,
+            "next_cursor": next_cursor,
+        }
+
+    def pair_stats(self, filters, page_size=DEFAULT_PAGE_SIZE, cursor=None):
+        """按有向交易对 (from_address, to_address) 分组的分页统计。
+
+        每条匹配交易以原字符串的有向组合各归一组，自转账（from == to）
+        也累计一次：该对的 total_count 加一、金额累计一次。
+
+        返回 {groups, total_groups, next_cursor}；每组含 from_address、
+        to_address、total_count、total_amount、avg_amount（金额为十进制
+        整数字符串，平均值向下取整）。顺序：total_amount 降序、
+        total_count 降序、from_address 的 Unicode 码点升序、
+        to_address 的 Unicode 码点升序。
+        """
+        self._validate_page_size(page_size)
+
+        totals = {}
+        counts = {}
+        for record in self._records:
+            if not _matches(record, filters):
+                continue
+            key = (record["from_address"], record["to_address"])
+            totals[key] = totals.get(key, 0) + int(record["amount"])
+            counts[key] = counts.get(key, 0) + 1
+
+        # (-total, -count, from, to) 升序即 total/count 降序、from/to
+        # 升序，同时得到可直接 bisect 的单调递增键
+        pairs = sorted(
+            totals, key=lambda p: (-totals[p], -counts[p], p[0], p[1])
+        )
+        total_groups = len(pairs)
+
+        start = 0
+        if cursor is not None:
+            (
+                after_total,
+                after_count,
+                after_from,
+                after_to,
+            ) = decode_pair_stats_cursor(cursor, filters)
+            keys = [
+                (-totals[p], -counts[p], p[0], p[1]) for p in pairs
+            ]
+            marker = (-after_total, -after_count, after_from, after_to)
+            # keyset 续页：排序键严格大于 marker 的第一个位置。
+            # marker 位于两键之间也安全（bisect 取下一键），不会跳过或重复。
+            start = bisect.bisect_left(keys, marker)
+            if start < total_groups and keys[start] == marker:
+                # marker 命中现存分组本身：从其后一组开始
+                start += 1
+
+        end = start + page_size
+        page_pairs = pairs[start:end]
+        groups = [
+            {
+                "from_address": frm,
+                "to_address": to,
+                "total_count": counts[(frm, to)],
+                "total_amount": str(totals[(frm, to)]),
+                "avg_amount": str(totals[(frm, to)] // counts[(frm, to)]),
+            }
+            for frm, to in page_pairs
+        ]
+        if end < total_groups:
+            last_from, last_to = page_pairs[-1]
+            next_cursor = encode_pair_stats_cursor(
+                filters, totals[page_pairs[-1]], counts[page_pairs[-1]],
+                last_from, last_to,
             )
         else:
             next_cursor = None

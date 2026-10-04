@@ -855,6 +855,233 @@ class CliTest(unittest.TestCase):
         self.assertEqual(payload["error"], "invalid_transaction")
         self.assertEqual(payload["input_line"], 4)
 
+    def test_pair_stats(self):
+        code, page1, _ = self._run([
+            "pair-stats", self.path, "--page-size", "1"])
+        self.assertEqual(code, 0)
+        # h1 alice→bob 10、h2 bob→alice 21、h3 alice→carol 5
+        self.assertEqual(page1["total_groups"], 3)
+        self.assertEqual(page1["groups"], [{
+            "from_address": "bob",
+            "to_address": "alice",
+            "total_count": 1,
+            "total_amount": "21",
+            "avg_amount": "21",
+        }])
+        self.assertIsNotNone(page1["next_cursor"])
+
+        code, page2, _ = self._run([
+            "pair-stats", self.path, "--page-size", "1",
+            "--cursor", page1["next_cursor"],
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(page2["groups"], [{
+            "from_address": "alice",
+            "to_address": "bob",
+            "total_count": 1,
+            "total_amount": "10",
+            "avg_amount": "10",
+        }])
+        self.assertEqual(page2["total_groups"], 3)
+
+        code, page3, _ = self._run([
+            "pair-stats", self.path, "--page-size", "1",
+            "--cursor", page2["next_cursor"],
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(page3["groups"], [{
+            "from_address": "alice",
+            "to_address": "carol",
+            "total_count": 1,
+            "total_amount": "5",
+            "avg_amount": "5",
+        }])
+        self.assertIsNone(page3["next_cursor"])
+
+    def test_pair_stats_self_transfer(self):
+        path = os.path.join(self.tmp.name, "self_pair.jsonl")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "tx_hash": "s1", "block_number": 1, "timestamp": 1,
+                "from_address": "eva", "to_address": "eva",
+                "method": "m", "amount": "100",
+            }) + "\n")
+        code, page, _ = self._run(["pair-stats", path])
+        self.assertEqual(code, 0)
+        self.assertEqual(page["total_groups"], 1)
+        self.assertEqual(page["groups"], [{
+            "from_address": "eva",
+            "to_address": "eva",
+            "total_count": 1,
+            "total_amount": "100",
+            "avg_amount": "100",
+        }])
+        self.assertIsNone(page["next_cursor"])
+
+    def test_pair_stats_walk_all_pages(self):
+        collected = []
+        cursor = None
+        while True:
+            argv = ["pair-stats", self.path, "--page-size", "2"]
+            if cursor is not None:
+                argv += ["--cursor", cursor]
+            code, page, _ = self._run(argv)
+            self.assertEqual(code, 0)
+            collected.extend(
+                (g["from_address"], g["to_address"]) for g in page["groups"]
+            )
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(
+            collected,
+            [("bob", "alice"), ("alice", "bob"), ("alice", "carol")],
+        )
+
+    def test_pair_stats_no_match(self):
+        code, page, _ = self._run(
+            ["pair-stats", self.path, "--method", "x"])
+        self.assertEqual(code, 0)
+        self.assertEqual(page, {
+            "groups": [],
+            "total_groups": 0,
+            "next_cursor": None,
+        })
+
+    def test_pair_stats_default_page_size_is_100(self):
+        code, page, _ = self._run(["pair-stats", self.path])
+        self.assertEqual(code, 0)
+        self.assertEqual(page["total_groups"], 3)
+        self.assertIsNone(page["next_cursor"])
+
+    def test_pair_stats_filters(self):
+        code, page, _ = self._run([
+            "pair-stats", self.path,
+            "--from-address", "bob",
+            "--to-address", "alice",
+            "--start-time", "15",
+        ])
+        self.assertEqual(code, 0)
+        # 仅 h2 bob→alice 21 命中
+        self.assertEqual(
+            [(g["from_address"], g["to_address"]) for g in page["groups"]],
+            [("bob", "alice")],
+        )
+        self.assertEqual(page["groups"][0]["total_amount"], "21")
+
+    def test_pair_stats_invalid_page_size_exit_2(self):
+        code, out, err = self._run(
+            ["pair-stats", self.path, "--page-size", "5000"])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_page_size")
+        self.assertIsNone(payload["input_line"])
+
+    def test_pair_stats_cross_command_cursor_exit_2(self):
+        for source in ("query", "method-stats", "address-stats",
+                       "time-stats"):
+            argv = [source, self.path, "--page-size", "1"]
+            if source == "time-stats":
+                argv += ["--bucket-size", "15"]
+            code, src_page, _ = self._run(argv)
+            self.assertEqual(code, 0)
+            code, out, err = self._run([
+                "pair-stats", self.path,
+                "--cursor", src_page["next_cursor"],
+            ])
+            self.assertEqual(code, 2)
+            self.assertIsNone(out)
+            payload = json.loads(err)
+            self.assertEqual(payload["error"], "invalid_cursor")
+            self.assertIsNone(payload["input_line"])
+
+        # 反向：pair-stats 游标用于其他命令同样拒绝
+        code, pair_page, _ = self._run(
+            ["pair-stats", self.path, "--page-size", "1"])
+        self.assertEqual(code, 0)
+        for target in ("query", "method-stats", "address-stats"):
+            code, out, err = self._run([
+                target, self.path,
+                "--cursor", pair_page["next_cursor"],
+            ])
+            self.assertEqual(code, 2)
+            self.assertEqual(
+                json.loads(err)["error"], "invalid_cursor"
+            )
+
+    def test_pair_stats_cursor_bound_to_filters(self):
+        code, page1, _ = self._run([
+            "pair-stats", self.path,
+            "--address", "alice", "--page-size", "1"])
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(page1["next_cursor"])
+
+        code, out, err = self._run([
+            "pair-stats", self.path,
+            "--address", "bob", "--page-size", "1",
+            "--cursor", page1["next_cursor"]])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_cursor")
+        self.assertIsNone(payload["input_line"])
+
+    def test_pair_stats_cursor_not_bound_to_page_size(self):
+        code, page1, _ = self._run([
+            "pair-stats", self.path, "--page-size", "1"])
+        self.assertEqual(code, 0)
+        code, page2, _ = self._run([
+            "pair-stats", self.path, "--page-size", "100",
+            "--cursor", page1["next_cursor"]])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(page2["groups"]), 2)
+        self.assertIsNone(page2["next_cursor"])
+
+    def test_pair_stats_data_error_has_line_no(self):
+        bad = os.path.join(self.tmp.name, "bad_pair.jsonl")
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(DATA_LINES[0]) + "\n")
+            fh.write("{broken\n")
+        code, _, err = self._run(["pair-stats", bad])
+        self.assertEqual(code, 2)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_transaction")
+        self.assertEqual(payload["input_line"], 2)
+
+    def test_pair_stats_duplicate_transaction(self):
+        dup = os.path.join(self.tmp.name, "dup_pair.jsonl")
+        with open(dup, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(DATA_LINES[0]) + "\n")
+            fh.write(json.dumps(DATA_LINES[0]) + "\n")
+        code, _, err = self._run(["pair-stats", dup])
+        self.assertEqual(code, 2)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "duplicate_transaction")
+        self.assertEqual(payload["input_line"], 2)
+
+    def test_pair_stats_invalid_filter_before_file_read(self):
+        missing = os.path.join(self.tmp.name, "missing.jsonl")
+        code, out, err = self._run(
+            ["pair-stats", missing,
+             "--address", "a", "--from-address", "b"])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_filter")
+        self.assertIsNone(payload["input_line"])
+
+    def test_pair_stats_invalid_time_range_before_file_read(self):
+        missing = os.path.join(self.tmp.name, "missing.jsonl")
+        code, out, err = self._run(
+            ["pair-stats", missing,
+             "--start-time", "100", "--end-time", "1"])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_time_range")
+        self.assertIsNone(payload["input_line"])
+
 
 if __name__ == "__main__":
     unittest.main()
