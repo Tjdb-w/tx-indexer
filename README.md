@@ -204,6 +204,72 @@
 - 末页 `next_cursor` 为 `null`。游标不透明且自校验，绑定 address-time-stats、等价筛选与 `bucket_size`，不绑定 `page-size`；跨命令复用、改变筛选或 `bucket_size`、篡改或解码失败都会报 `invalid_cursor`。
 - 无匹配时：`groups` 为 `[]`、`total_groups` 为 `0`、`next_cursor` 为 `null`。
 
+## 增量导入与断点续传
+
+`tx_indexer.importer.IncrementalImporter` 在查询索引之上提供增量交易导入：
+持续接收按区块高度排列的批次，单个批次要么完整写入、要么完整拒绝，
+同一位置重试得到可重复的结果。导入与查询共享同一份内存存储，导入返回
+成功后查询与聚合立即观察到本批全部交易；已有查询、聚合与分页游标行为
+不受影响。
+
+```python
+from tx_indexer.importer import IncrementalImporter
+
+importer = IncrementalImporter()
+result = importer.import_batch(batch)            # 首个批次
+result = importer.import_batch(batch, cursor=result["next_import_cursor"])
+indexer = importer.indexer                        # 底层 TxIndexer，可直接查询
+```
+
+批次结构（未定义的额外字段被忽略）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `chain_id` | 非空字符串 | 链标识；首个批次确定后不可变更 |
+| `start_block` | 非负整数 | 本批（区块）高度 |
+| `block_hash` | 非空字符串 | 本批区块哈希 |
+| `transactions` | 数组 | 该区块内的交易列表，按原始顺序 |
+
+每笔交易至少包含：`tx_hash`、`block_number`、`block_hash`、`timestamp`、
+`from_address`、`to_address`、`method`、`amount`、`fee`、`success`。
+其中 `block_number` 必须等于批次 `start_block`、`block_hash` 必须等于
+批次 `block_hash`；`amount` / `fee` 为非负十进制整数字符串，
+`success` 为布尔值。
+
+导入成功返回（机器可读字段稳定）：
+
+```json
+{
+  "status": "ok",
+  "imported_count": 2,
+  "skipped_count": 1,
+  "confirmed_block_height": 10,
+  "confirmed_block_hash": "0xabc",
+  "next_import_cursor": "eyJ..."
+}
+```
+
+续接规则：首个批次不要求游标；此后每次导入必须携带上一批返回的
+`next_import_cursor`，且 `start_block` 为已确认高度 +1（新区块），或
+指向已导入的高度（同一位置重试，要求区块哈希与交易集合完全一致）。
+同一交易哈希再次出现且区块、时间、地址、方法、数值、费用、成功状态
+完全一致时视为重试：跳过、不覆盖已存在数据、不重复计数或累计聚合。
+导入游标只绑定链标识、已确认高度与区块哈希，与分页游标相互独立，
+混用两边都会被拒绝。
+
+导入拒绝时不产生任何新增索引数据，返回：
+
+```json
+{"status": "rejected", "error_code": "TX_CONFLICT", "message": "..."}
+```
+
+| error_code | 触发条件 |
+| --- | --- |
+| `INVALID_IMPORT_BATCH` | 批次缺少链标识、区块高度、区块哈希或交易必填字段，或字段类型非法、交易与批次声明的区块不一致 |
+| `IMPORT_CURSOR_MISMATCH` | 游标缺失、非法或与当前已确认状态不一致；起始区块高度无法无缝续接（跳高度、未知旧高度、链标识不同） |
+| `TX_CONFLICT` | 交易哈希已存在且任一决定查询结果的字段不同 |
+| `BLOCK_CONFLICT` | 已导入高度上的区块哈希不同，或同一区块哈希对应的交易集合发生变化 |
+
 ## 错误处理
 
 领域错误输出到 stderr（单行 JSON，含 `error`、`message`、`input_line`），退出码为 `2`。只有输入数据行错误才带 1 起始行号，其余错误 `input_line` 为 `null`。
@@ -222,11 +288,12 @@
 
 - `tx_indexer/loader.py`：JSON Lines 解析与校验
 - `tx_indexer/engine.py`：筛选、排序、keyset 游标分页、聚合
-- `tx_indexer/cursor.py`：不透明游标编解码（base64url）
+- `tx_indexer/cursor.py`：不透明游标编解码（base64url），含独立的导入游标
+- `tx_indexer/importer.py`：增量交易导入与断点续传
 - `tx_indexer/errors.py`：七类异常
 - `tx_indexer/cli.py`：命令行入口
 - `tests/`：unittest 测试（`python3 -m unittest discover -s tests`）
 
 ## 状态
 
-已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按参与地址分页汇总（address-stats）、按交易对手分页汇总（counterparty-stats）、按固定宽度时间区间分页汇总（time-stats）、按有向交易对分页汇总（pair-stats）、按时间区间 × 参与地址分页汇总（address-time-stats）与七类异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选。
+已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按参与地址分页汇总（address-stats）、按交易对手分页汇总（counterparty-stats）、按固定宽度时间区间分页汇总（time-stats）、按有向交易对分页汇总（pair-stats）、按时间区间 × 参与地址分页汇总（address-time-stats）与七类异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选；增量交易导入与断点续传（原子批次、重试判重、四类机器可读拒绝码、独立导入游标）。

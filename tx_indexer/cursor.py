@@ -28,6 +28,8 @@ SCOPE_COUNTERPARTY_STATS = "counterparty-stats"
 SCOPE_TIME_STATS = "time-stats"
 SCOPE_PAIR_STATS = "pair-stats"
 SCOPE_ADDRESS_TIME_STATS = "address-time-stats"
+#: 增量导入游标的作用域标识（与所有分页游标相互独立，不能混用）
+SCOPE_IMPORT = "import"
 
 
 def _as_sorted_list(value):
@@ -286,6 +288,63 @@ def decode_time_stats_cursor(token, filters, bucket_size):
         raise InvalidCursorError("游标位置信息非法", None)
 
     return after
+
+
+def encode_import_cursor(chain_id, confirmed_height, block_hash):
+    """导入游标：绑定链标识、已确认区块高度与对应区块哈希。
+
+    不携带筛选快照，作用域为 ``import``，与全部分页游标相互独立：
+    分页游标解码要求各自命令作用域，导入游标用于分页会报
+    InvalidCursorError，反之亦然。
+    """
+    payload = {
+        "v": _CURSOR_VERSION,
+        "c": SCOPE_IMPORT,
+        "chain": chain_id,
+        "height": confirmed_height,
+        "hash": block_hash,
+    }
+    return _encode_payload(payload)
+
+
+def decode_import_cursor(token):
+    """解码并校验导入游标。
+
+    返回 ``(chain_id, confirmed_height, block_hash)``；格式错误、版本
+    不符、作用域不符或字段非法都抛 InvalidCursorError。
+    """
+    if not isinstance(token, str) or token == "":
+        raise InvalidCursorError("游标为空或类型非法", None)
+
+    raw = _b64url_decode(token)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InvalidCursorError("游标内容非法", None) from exc
+
+    if not isinstance(payload, dict) or payload.get("v") != _CURSOR_VERSION:
+        raise InvalidCursorError("游标版本不受支持", None)
+
+    if payload.get("c") != SCOPE_IMPORT:
+        raise InvalidCursorError("游标不属于导入命令", None)
+
+    chain_id = payload.get("chain")
+    if not isinstance(chain_id, str) or chain_id.strip() == "":
+        raise InvalidCursorError("游标链标识非法", None)
+
+    height = payload.get("height")
+    if (
+        not isinstance(height, int)
+        or isinstance(height, bool)
+        or height < 0
+    ):
+        raise InvalidCursorError("游标区块高度非法", None)
+
+    block_hash = payload.get("hash")
+    if not isinstance(block_hash, str) or block_hash.strip() == "":
+        raise InvalidCursorError("游标区块哈希非法", None)
+
+    return chain_id, height, block_hash
 
 
 def encode_pair_stats_cursor(filters, after_total_amount, after_count,
