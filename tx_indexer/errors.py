@@ -59,3 +59,9 @@ class InvalidCursorError(TxIndexerError):
     """游标非法（格式错误、解码失败）或与当前筛选不匹配。"""
 
     error = "invalid_cursor"
+
+
+class InvalidBucketSizeError(TxIndexerError):
+    """bucket_size 缺失、无法解析为整数或不大于 0。"""
+
+    error = "invalid_bucket_size"

@@ -4,6 +4,7 @@ import unittest
 
 from tx_indexer.engine import TxIndexer, normalize_filters
 from tx_indexer.errors import (
+    InvalidBucketSizeError,
     InvalidCursorError,
     InvalidFilterError,
     InvalidPageSizeError,
@@ -926,6 +927,231 @@ class CounterpartyStatsTest(unittest.TestCase):
         self.assertEqual(group["counterparty"], "b")
         self.assertEqual(group["total_amount"], big)
         self.assertEqual(group["avg_amount"], big)
+
+
+class TimeStatsTest(unittest.TestCase):
+    def setUp(self):
+        self.records = [
+            rec("h1", 1, 10, "alice", "bob", "transfer", "10"),
+            rec("h2", 2, 20, "bob", "alice", "approve", "21"),
+            rec("h3", 2, 30, "alice", "carol", "transfer", "5"),
+            rec("h4", 3, 300, "bob", "dave", "transfer", "40"),
+            rec("h5", 4, 50, "carol", "dave", "transfer", "100"),
+        ]
+        self.idx = TxIndexer(self.records)
+        self.filters = normalize_filters()
+
+    def test_bucket_alignment_epoch_left_closed_right_open(self):
+        # bucket_size=60：区间 [0,60)、[60,120)、[120,180)…
+        records = [
+            rec("b0", 1, 0, "a", "b", "m", "1"),
+            rec("b59", 2, 59, "a", "b", "m", "2"),
+            rec("b60", 3, 60, "a", "b", "m", "4"),
+            rec("b119", 4, 119, "a", "b", "m", "8"),
+            rec("b120", 5, 120, "a", "b", "m", "16"),
+        ]
+        result = TxIndexer(records).time_stats(self.filters, 60)
+        self.assertEqual(
+            [(g["bucket_start"], g["bucket_end_exclusive"],
+              g["total_count"], g["total_amount"])
+             for g in result["groups"]],
+            [(0, 60, 2, "3"), (60, 120, 2, "12"), (120, 180, 1, "16")],
+        )
+        self.assertEqual(result["total_groups"], 3)
+
+    def test_grouping_aggregation_and_avg_floor(self):
+        result = self.idx.time_stats(self.filters, 60)
+        groups = result["groups"]
+        self.assertEqual(
+            [(g["bucket_start"], g["bucket_end_exclusive"], g["total_count"],
+              g["total_amount"], g["avg_amount"]) for g in groups],
+            [
+                (0, 60, 4, "136", "34"),    # 136 // 4
+                (300, 360, 1, "40", "40"),
+            ],
+        )
+        self.assertEqual(result["total_groups"], 2)
+        self.assertIsNone(result["next_cursor"])
+
+    def test_avg_amount_floors(self):
+        records = [
+            rec("a", 1, 1, "x", "y", "m", "10"),
+            rec("b", 2, 2, "x", "y", "m", "10"),
+            rec("c", 3, 3, "x", "y", "m", "10"),
+        ]
+        result = TxIndexer(records).time_stats(self.filters, 60)
+        group = result["groups"][0]
+        self.assertEqual(group["total_amount"], "30")
+        self.assertEqual(group["avg_amount"], "10")
+        records[2]["amount"] = "11"
+        result = TxIndexer(records).time_stats(self.filters, 60)
+        self.assertEqual(result["groups"][0]["avg_amount"], "10")  # 31 // 3
+
+    def test_only_nonempty_buckets_returned(self):
+        # ts 10 与 ts 1000 之间大量空区间不得出现
+        records = [
+            rec("a", 1, 10, "x", "y", "m", "1"),
+            rec("b", 2, 1000, "x", "y", "m", "2"),
+        ]
+        result = TxIndexer(records).time_stats(self.filters, 60)
+        self.assertEqual(
+            [g["bucket_start"] for g in result["groups"]], [0, 960]
+        )
+        self.assertEqual(result["total_groups"], 2)
+
+    def test_sorted_by_bucket_start_ascending(self):
+        result = self.idx.time_stats(self.filters, 10)
+        starts = [g["bucket_start"] for g in result["groups"]]
+        self.assertEqual(starts, sorted(starts))
+        self.assertEqual(starts, [10, 20, 30, 50, 300])
+
+    def test_result_field_order(self):
+        result = self.idx.time_stats(self.filters, 60)
+        self.assertEqual(
+            list(result.keys()), ["groups", "total_groups", "next_cursor"]
+        )
+        group = result["groups"][0]
+        self.assertEqual(
+            list(group.keys()),
+            ["bucket_start", "bucket_end_exclusive", "total_count",
+             "total_amount", "avg_amount"],
+        )
+        self.assertIsInstance(group["bucket_start"], int)
+        self.assertIsInstance(group["bucket_end_exclusive"], int)
+        self.assertIsInstance(group["total_amount"], str)
+        self.assertIsInstance(group["avg_amount"], str)
+
+    def test_no_match(self):
+        result = self.idx.time_stats(
+            normalize_filters(method="nonexistent"), 60
+        )
+        self.assertEqual(
+            result, {"groups": [], "total_groups": 0, "next_cursor": None}
+        )
+
+    def test_filters_applied(self):
+        result = self.idx.time_stats(
+            normalize_filters(method="transfer"), 60
+        )
+        self.assertEqual(
+            [(g["bucket_start"], g["total_count"], g["total_amount"])
+             for g in result["groups"]],
+            [(0, 3, "115"), (300, 1, "40")],
+        )
+
+    def test_time_window_inclusive_both_ends(self):
+        # 时间窗左闭右闭：端点 10 与 50 都计入
+        result = self.idx.time_stats(
+            normalize_filters(start_time=10, end_time=50), 60
+        )
+        self.assertEqual(result["total_groups"], 1)
+        group = result["groups"][0]
+        self.assertEqual(group["bucket_start"], 0)
+        self.assertEqual(group["total_count"], 4)
+
+    def test_pagination_no_skip_no_dup_no_reorder(self):
+        collected = []
+        cursor = None
+        pages = 0
+        while True:
+            page = self.idx.time_stats(
+                self.filters, 10, page_size=2, cursor=cursor
+            )
+            pages += 1
+            collected.extend(g["bucket_start"] for g in page["groups"])
+            self.assertEqual(page["total_groups"], 5)
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(pages, 3)  # 5 个区间、page_size=2：3 页
+        self.assertEqual(collected, [10, 20, 30, 50, 300])
+
+    def test_cursor_not_bound_to_page_size(self):
+        page1 = self.idx.time_stats(self.filters, 10, page_size=1)
+        self.assertEqual(
+            [g["bucket_start"] for g in page1["groups"]], [10]
+        )
+        page2 = self.idx.time_stats(
+            self.filters, 10, page_size=100, cursor=page1["next_cursor"]
+        )
+        self.assertEqual(
+            [g["bucket_start"] for g in page2["groups"]], [20, 30, 50, 300]
+        )
+        self.assertIsNone(page2["next_cursor"])
+
+    def test_cursor_bound_to_bucket_size(self):
+        page1 = self.idx.time_stats(self.filters, 60, page_size=1)
+        with self.assertRaises(InvalidCursorError):
+            self.idx.time_stats(
+                self.filters, 30, page_size=1, cursor=page1["next_cursor"]
+            )
+
+    def test_cursor_bound_to_filters(self):
+        page1 = self.idx.time_stats(self.filters, 10, page_size=1)
+        with self.assertRaises(InvalidCursorError):
+            self.idx.time_stats(
+                normalize_filters(method="transfer"),
+                10,
+                page_size=1,
+                cursor=page1["next_cursor"],
+            )
+
+    def test_cross_command_cursor_rejected(self):
+        from tx_indexer.cursor import (
+            decode_method_stats_cursor,
+            decode_time_stats_cursor,
+            encode_method_stats_cursor,
+            encode_time_stats_cursor,
+        )
+
+        filters = normalize_filters()
+        time_cursor = encode_time_stats_cursor(filters, 60, 0)
+        method_cursor = encode_method_stats_cursor(filters, 10, 1, "m")
+        with self.assertRaises(InvalidCursorError):
+            decode_time_stats_cursor(method_cursor, filters, 60)
+        with self.assertRaises(InvalidCursorError):
+            decode_method_stats_cursor(time_cursor, filters)
+
+    def test_cursor_garbage(self):
+        for bad in ("", "not-base64!!!", "bm9wZQ", "%%%"):
+            with self.assertRaises(InvalidCursorError):
+                self.idx.time_stats(self.filters, 60, cursor=bad)
+
+    def test_cursor_tampered(self):
+        import base64
+        import json
+
+        page1 = self.idx.time_stats(self.filters, 10, page_size=1)
+        token = page1["next_cursor"]
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+        payload = json.loads(raw.decode("utf-8"))
+        payload["after"] = "not-an-int"  # 篡改位置信息
+        tampered = base64.urlsafe_b64encode(
+            json.dumps(payload).encode("utf-8")
+        ).rstrip(b"=").decode("ascii")
+        with self.assertRaises(InvalidCursorError):
+            self.idx.time_stats(self.filters, 10, cursor=tampered)
+
+    def test_invalid_bucket_size(self):
+        for bad in (0, -1, -60, "60", 1.5, True, None):
+            with self.assertRaises(InvalidBucketSizeError):
+                self.idx.time_stats(self.filters, bad)
+
+    def test_invalid_page_size(self):
+        for bad in (0, -1, 1001, "10", None):
+            with self.assertRaises(InvalidPageSizeError):
+                self.idx.time_stats(self.filters, 60, page_size=bad)
+
+    def test_big_amounts_exact_decimal(self):
+        big = "123456789012345678901234567890"
+        idx = TxIndexer([
+            rec("x", 1, 1, "a", "b", "m", big),
+            rec("y", 2, 2, "a", "b", "m", "10"),
+        ])
+        result = idx.time_stats(normalize_filters(), 60)
+        group = result["groups"][0]
+        self.assertEqual(group["total_amount"], str(int(big) + 10))
+        self.assertEqual(group["avg_amount"], str((int(big) + 10) // 2))
 
 
 if __name__ == "__main__":

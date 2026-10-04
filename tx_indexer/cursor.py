@@ -25,6 +25,7 @@ SCOPE_QUERY = "query"
 SCOPE_METHOD_STATS = "method-stats"
 SCOPE_ADDRESS_STATS = "address-stats"
 SCOPE_COUNTERPARTY_STATS = "counterparty-stats"
+SCOPE_TIME_STATS = "time-stats"
 
 
 def _as_sorted_list(value):
@@ -245,3 +246,41 @@ def _decode_stats_cursor(token, filters, expected_scope):
         raise InvalidCursorError("游标位置信息非法", None)
 
     return after[0], after[1], after[2], after[3], after[4]
+
+
+def encode_time_stats_cursor(filters, bucket_size, after_bucket_start):
+    """time-stats 游标：除筛选外还绑定 bucket_size，不绑定 page_size。"""
+    payload = {
+        "v": _CURSOR_VERSION,
+        "c": SCOPE_TIME_STATS,
+        "f": _canonical_filters(filters),
+        "b": bucket_size,
+        "after": after_bucket_start,
+    }
+    return _encode_payload(payload)
+
+
+def decode_time_stats_cursor(token, filters, bucket_size):
+    """解码并校验 time-stats 游标，返回 exclusive marker ``bucket_start``。
+
+    游标内 bucket_size 与当前请求不一致时报 InvalidCursorError。
+    """
+    payload = _decode_payload(token, filters, SCOPE_TIME_STATS)
+
+    saved_bucket_size = payload.get("b")
+    if (
+        not isinstance(saved_bucket_size, int)
+        or isinstance(saved_bucket_size, bool)
+        or saved_bucket_size != bucket_size
+    ):
+        raise InvalidCursorError("游标与当前 bucket_size 不匹配", None)
+
+    after = payload.get("after")
+    if (
+        not isinstance(after, int)
+        or isinstance(after, bool)
+        or after < 0
+    ):
+        raise InvalidCursorError("游标位置信息非法", None)
+
+    return after

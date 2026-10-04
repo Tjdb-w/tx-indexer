@@ -14,6 +14,8 @@ receive_count 降序、address 码点升序。
 counterparty-stats 排序键与 address-stats 相同，末级改为 counterparty
 码点升序；每笔匹配交易只归入一个对手（发送方为观察地址时归
 to_address，接收方为观察地址时归 from_address，自转账归观察地址本身）。
+time-stats 把匹配交易按从 Unix 纪元对齐、左闭右开的固定宽度时间区间
+分桶，只返回非空区间，按 bucket_start 升序分页。
 分页：不透明 keyset 游标（见 :mod:`tx_indexer.cursor`），相同命令与
 筛选下不跳过、不重复、不乱序；``total`` / ``total_groups`` 始终为
 全部匹配数 / 全部分组数。
@@ -26,12 +28,15 @@ from .cursor import (
     decode_counterparty_stats_cursor,
     decode_cursor,
     decode_method_stats_cursor,
+    decode_time_stats_cursor,
     encode_address_stats_cursor,
     encode_counterparty_stats_cursor,
     encode_cursor,
     encode_method_stats_cursor,
+    encode_time_stats_cursor,
 )
 from .errors import (
+    InvalidBucketSizeError,
     InvalidFilterError,
     InvalidPageSizeError,
     InvalidTimeRangeError,
@@ -563,6 +568,83 @@ class TxIndexer:
 
         return {
             "address": address,
+            "groups": groups,
+            "total_groups": total_groups,
+            "next_cursor": next_cursor,
+        }
+
+    @staticmethod
+    def _validate_bucket_size(bucket_size):
+        if (
+            not isinstance(bucket_size, int)
+            or isinstance(bucket_size, bool)
+            or bucket_size < 1
+        ):
+            raise InvalidBucketSizeError(
+                "bucket_size 必须为大于 0 的整数（秒）", None
+            )
+
+    def time_stats(self, filters, bucket_size, page_size=DEFAULT_PAGE_SIZE,
+                   cursor=None):
+        """按固定宽度时间区间分桶的分页统计。
+
+        区间从 Unix 纪元对齐、左闭右开：``bucket_start = (timestamp //
+        bucket_size) * bucket_size``，``bucket_end_exclusive =
+        bucket_start + bucket_size``；每笔匹配交易恰好进入一个区间。
+        只返回有交易的区间，按 bucket_start 升序分页。
+
+        返回 {groups, total_groups, next_cursor}；每组含 bucket_start、
+        bucket_end_exclusive（均为 UTC 秒整数）、total_count、
+        total_amount、avg_amount（金额为十进制整数字符串，平均值向下
+        取整）。游标绑定本命令、等价筛选与 bucket_size，不绑定
+        page_size。
+        """
+        self._validate_page_size(page_size)
+        self._validate_bucket_size(bucket_size)
+
+        totals = {}
+        counts = {}
+        for record in self._records:
+            if not _matches(record, filters):
+                continue
+            bucket_start = (record["timestamp"] // bucket_size) * bucket_size
+            totals[bucket_start] = (
+                totals.get(bucket_start, 0) + int(record["amount"])
+            )
+            counts[bucket_start] = counts.get(bucket_start, 0) + 1
+
+        starts = sorted(totals)
+        total_groups = len(starts)
+
+        start = 0
+        if cursor is not None:
+            after_bucket_start = decode_time_stats_cursor(
+                cursor, filters, bucket_size
+            )
+            # keyset 续页：bucket_start 严格大于 marker 的第一个区间。
+            # marker 位于两键之间也安全，不会跳过或重复。
+            start = bisect.bisect_right(starts, after_bucket_start)
+
+        end = start + page_size
+        page_starts = starts[start:end]
+        groups = [
+            {
+                "bucket_start": bucket_start,
+                "bucket_end_exclusive": bucket_start + bucket_size,
+                "total_count": counts[bucket_start],
+                "total_amount": str(totals[bucket_start]),
+                "avg_amount": str(totals[bucket_start] // counts[bucket_start]),
+            }
+            for bucket_start in page_starts
+        ]
+        if end < total_groups:
+            next_cursor = encode_time_stats_cursor(
+                filters, bucket_size, page_starts[-1]
+            )
+        else:
+            next_cursor = None
+
+        return {
             "groups": groups,
             "total_groups": total_groups,
             "next_cursor": next_cursor,
