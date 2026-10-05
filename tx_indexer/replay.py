@@ -646,7 +646,9 @@ class MultiChainReplayManager:
         page_size 非法抛
         :class:`~tx_indexer.errors.InvalidPageSizeError`，筛选非法抛
         :class:`~tx_indexer.errors.InvalidFilterError` /
-        :class:`~tx_indexer.errors.InvalidTimeRangeError`。尚未开始的
+        :class:`~tx_indexer.errors.InvalidTimeRangeError` /
+        :class:`~tx_indexer.errors.InvalidAmountFilterError` /
+        :class:`~tx_indexer.errors.InvalidAmountRangeError`。尚未开始的
         链按空索引处理：transactions 为空、total 为 0、next_cursor 为
         None（携带与该链及筛选不匹配的游标仍抛 InvalidCursorError）。
         """

@@ -44,7 +44,12 @@ def _as_sorted_list(value):
 
 
 def _canonical_filters(filters):
-    """提取用于游标绑定比对的筛选快照（集合归一化为排序列表）。"""
+    """提取用于游标绑定比对的筛选快照（集合归一化为排序列表）。
+
+    金额边界在 :func:`tx_indexer.engine.normalize_filters` 中已归一化
+    为数值 int（或 None），因此只调整前导零的等价边界视为同一筛选；
+    旧版游标缺少金额字段时按 None 处理，与未指定边界的请求一致。
+    """
     return {
         "address": filters.get("address"),
         "from_address": _as_sorted_list(filters.get("from_address")),
@@ -52,6 +57,8 @@ def _canonical_filters(filters):
         "method": _as_sorted_list(filters.get("method")),
         "start_time": filters.get("start_time"),
         "end_time": filters.get("end_time"),
+        "min_amount": filters.get("min_amount"),
+        "max_amount": filters.get("max_amount"),
     }
 
 
