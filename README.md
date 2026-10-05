@@ -46,8 +46,9 @@
 - `--method METHOD`：精确匹配方法，可重复出现，集合内任一命中
 - `--start-time TS` / `--end-time TS`：非负 UTC 秒整数，含端点
 - `--min-amount N` / `--max-amount N`：金额闭区间，非负十进制整数（与交易 `amount` 同格式，按数值比较、含端点）；只给一端时另一端不限制，前导零不改变数值含义
+- `--min-block N` / `--max-block N`：区块高度闭区间，非负十进制整数（含端点）；只给一端时另一端不限制，前导零不改变数值含义
 
-集合类选项（`--from-address` / `--to-address` / `--method`）重复给定相同值等同一个条件。筛选值为空或仅含空白、或 `--address` 与付款方/收款方筛选并用，会在读取数据文件前报 `invalid_filter`。金额筛选为空、非字符串（Python 调用）、带正负号、小数点、空字符串或不符 `amount` 格式，会在读取数据文件前报 `invalid_amount_filter`；合法的最小值大于最大值报 `invalid_amount_range`。
+集合类选项（`--from-address` / `--to-address` / `--method`）重复给定相同值等同一个条件。筛选值为空或仅含空白、或 `--address` 与付款方/收款方筛选并用，会在读取数据文件前报 `invalid_filter`。金额筛选为空、非字符串（Python 调用）、带正负号、小数点、空字符串或不符 `amount` 格式，会在读取数据文件前报 `invalid_amount_filter`；合法的最小值大于最大值报 `invalid_amount_range`。区块边界为空、仅含空白、非十进制文本、带正负号、小数点、布尔值或 Python 非整数值，会在读取数据文件前报 `invalid_block_filter`；两端合法但最小值大于最大值报 `invalid_block_range`。命中条件为 `block_number >= min-block 且 <= max-block`，与其余筛选取交集；`query` 的 `total` 与各统计命令的 `total_count` / `total_groups` 均按交集后的交易计算。
 
 `query`、`method-stats`、`address-stats`、`counterparty-stats`、`time-stats`、`pair-stats` 与 `address-time-stats` 额外选项：
 
@@ -71,7 +72,7 @@
 ```
 
 - `total` 为全部匹配数（不是当前页条数）。
-- `next_cursor` 指向下一页；末页为 `null`。游标不透明且自校验，相同筛选下翻页不会跳过、重复或乱序；改变筛选条件（含金额边界）复用旧游标会报 `invalid_cursor`；金额边界按数值等价绑定，只调整前导零可继续翻页，增加、删除或改变任一边界则游标失效。
+- `next_cursor` 指向下一页；末页为 `null`。游标不透明且自校验，相同筛选下翻页不会跳过、重复或乱序；改变筛选条件（含金额边界与区块边界）复用旧游标会报 `invalid_cursor`；金额边界与区块边界按数值等价绑定，只调整前导零可继续翻页，增加、删除或改变任一边界则游标失效；不携带区块边界字段的旧游标仅在本次未指定任一边界时可续翻。
 
 ### stats 返回
 
@@ -518,8 +519,10 @@ summary = manager.stats("chain-a", normalize_filters(method="transfer"))
 | `invalid_time_range` | 时间窗倒置（`start_time > end_time`） |
 | `invalid_amount_filter` | 金额筛选值为空、非字符串、带正负号、小数点或不符非负十进制整数格式（读取数据文件前报错） |
 | `invalid_amount_range` | 合法的 `min_amount` 数值大于 `max_amount`（读取数据文件前报错） |
+| `invalid_block_filter` | 区块边界为空、仅含空白、非十进制文本、带正负号、小数点、布尔值或 Python 非整数值（读取数据文件前报错） |
+| `invalid_block_range` | 两端合法的 `min_block` 大于 `max_block`（读取数据文件前报错） |
 | `invalid_page_size` | `page_size` 越界或无法解析 |
-| `invalid_cursor` | 游标非法（格式/解码错误）或与当前筛选不匹配；金额边界按数值等价绑定，只改前导零可续页，增减或改变任一边界失效 |
+| `invalid_cursor` | 游标非法（格式/解码错误）或与当前筛选不匹配；金额边界与区块边界按数值等价绑定，只改前导零可续页，增减或改变任一边界失效；不携带区块边界字段的旧游标仅在未指定区块边界时可续页 |
 | `invalid_filter` | 筛选值为空白、`--address` 与 `--from-address` / `--to-address` 并用，或 counterparty-stats 缺少 `--address`（读取数据文件前报错） |
 | `invalid_bucket_size` | `--bucket-size` 缺失、非整数或不大于 0（time-stats / address-time-stats，读取数据文件前报错） |
 
@@ -554,4 +557,4 @@ summary = manager.stats("chain-a", normalize_filters(method="transfer"))
 
 ## 状态
 
-已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按参与地址分页汇总（address-stats）、按交易对手分页汇总（counterparty-stats）、按固定宽度时间区间分页汇总（time-stats）、按有向交易对分页汇总（pair-stats）、按时间区间 × 参与地址分页汇总（address-time-stats）与领域异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选；`--min-amount` / `--max-amount` 金额闭区间筛选（按十进制整数数值比较、前导零等价、与其他筛选取交集，query/stats/六类分组统计与多链入口全部基于命中交易重算，非法值报 `invalid_amount_filter`、区间倒置报 `invalid_amount_range`，游标按数值等价绑定金额边界）；增量交易导入与断点续传（原子批次、重试判重、四类机器可读拒绝码、独立导入游标）；链重组后缀替换（`replace_from`，原子覆盖已导入高度至链尖、保留更低前缀、旧后缀同名不冲突、四类计数字段与 `INVALID_REPLACEMENT_BATCH` 拒绝码）；索引水位与幂等重放（`ReplayManager.submit` / `status`：按链连续水位、升序分批、整批原子提交、重复跳过、`TransactionConflictError` 冲突停止、`SourceUnavailableError` 断点续传、同链并发合并/等待、不扫描明细的只读状态入口）；多链共用入口 `MultiChainReplayManager`（按链隔离的独立 `ReplayManager`：跨链同哈希属不同交易、异链独立不阻塞、submit/status/query/stats 返回口径不变、query 游标绑定 chain_id 与等价筛选，跨链/改筛选/与单索引游标互用均抛 `InvalidCursorError`；IncrementalImporter、JSON Lines、CLI 与既有输出不变）；时间分桶聚合（`time-bucket-aggregation` / `TxIndexer.time_bucket_aggregation`：必填左闭右开时间窗与 hour/day 桶粒度、可选 address/method，UTC 整点/整日连续桶含空桶零填充、total/success/failure 计数，游标绑定完整查询条件与桶粒度、不绑定 page-size、末页之后为空页与空游标；`invalid_aggregation_range` / `unsupported_aggregation_bucket` / `invalid_aggregation_filter` / `invalid_aggregation_cursor` 四类独立错误，全部先于分页数据抛出，既有查询、聚合统计与游标结果不变）。
+已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按参与地址分页汇总（address-stats）、按交易对手分页汇总（counterparty-stats）、按固定宽度时间区间分页汇总（time-stats）、按有向交易对分页汇总（pair-stats）、按时间区间 × 参与地址分页汇总（address-time-stats）与领域异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选；`--min-amount` / `--max-amount` 金额闭区间筛选（按十进制整数数值比较、前导零等价、与其他筛选取交集，query/stats/六类分组统计与多链入口全部基于命中交易重算，非法值报 `invalid_amount_filter`、区间倒置报 `invalid_amount_range`，游标按数值等价绑定金额边界）；增量交易导入与断点续传（原子批次、重试判重、四类机器可读拒绝码、独立导入游标）；链重组后缀替换（`replace_from`，原子覆盖已导入高度至链尖、保留更低前缀、旧后缀同名不冲突、四类计数字段与 `INVALID_REPLACEMENT_BATCH` 拒绝码）；索引水位与幂等重放（`ReplayManager.submit` / `status`：按链连续水位、升序分批、整批原子提交、重复跳过、`TransactionConflictError` 冲突停止、`SourceUnavailableError` 断点续传、同链并发合并/等待、不扫描明细的只读状态入口）；多链共用入口 `MultiChainReplayManager`（按链隔离的独立 `ReplayManager`：跨链同哈希属不同交易、异链独立不阻塞、submit/status/query/stats 返回口径不变、query 游标绑定 chain_id 与等价筛选，跨链/改筛选/与单索引游标互用均抛 `InvalidCursorError`；IncrementalImporter、JSON Lines、CLI 与既有输出不变）；时间分桶聚合（`time-bucket-aggregation` / `TxIndexer.time_bucket_aggregation`：必填左闭右开时间窗与 hour/day 桶粒度、可选 address/method，UTC 整点/整日连续桶含空桶零填充、total/success/failure 计数，游标绑定完整查询条件与桶粒度、不绑定 page-size、末页之后为空页与空游标；`invalid_aggregation_range` / `unsupported_aggregation_bucket` / `invalid_aggregation_filter` / `invalid_aggregation_cursor` 四类独立错误，全部先于分页数据抛出，既有查询、聚合统计与游标结果不变）；区块高度筛选（`--min-block` / `--max-block` 与 `normalize_filters(min_block=…, max_block=…)`：含端点的非负整数闭区间，可单独提供并与既有筛选取交集，query/stats/六类分组统计全部基于命中交易重算 `total` / `total_count` / `total_groups`；非法边界报 `invalid_block_filter`、区间倒置报 `invalid_block_range`，均在读取数据文件前抛出；游标按数值等价绑定区块边界，仅前导零不同仍同条件，不携带边界字段的旧游标仅在未指定边界时可续翻；time-bucket-aggregation 与导入、替换、回放入口不变）。

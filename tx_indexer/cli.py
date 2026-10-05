@@ -15,7 +15,8 @@
 
 领域错误（invalid_transaction / duplicate_transaction / invalid_time_range /
 invalid_page_size / invalid_cursor / invalid_filter / invalid_bucket_size /
-invalid_amount_filter / invalid_amount_range / invalid_aggregation_range /
+invalid_amount_filter / invalid_amount_range / invalid_block_filter /
+invalid_block_range / invalid_aggregation_range /
 unsupported_aggregation_bucket / invalid_aggregation_filter /
 invalid_aggregation_cursor）
 以 JSON 对象输出到 stderr，退出码 2：
@@ -36,13 +37,14 @@ from .engine import (
 from .errors import (
     InvalidAggregationFilter,
     InvalidAggregationRange,
+    InvalidBlockFilterError,
     InvalidBucketSizeError,
     InvalidFilterError,
     InvalidPageSizeError,
     TxIndexerError,
     UnsupportedAggregationBucket,
 )
-from .loader import load_file
+from .loader import _AMOUNT_RE, load_file
 
 
 def _add_filter_args(parser):
@@ -74,6 +76,14 @@ def _add_filter_args(parser):
     parser.add_argument(
         "--max-amount",
         help="金额区间上界（非负十进制整数，含端点，按数值比较）",
+    )
+    parser.add_argument(
+        "--min-block",
+        help="区块高度下界（非负十进制整数，含端点）",
+    )
+    parser.add_argument(
+        "--max-block",
+        help="区块高度上界（非负十进制整数，含端点）",
     )
 
 
@@ -115,6 +125,16 @@ def _parse_bucket_size(value):
             "bucket_size 必须为大于 0 的整数（秒）", None
         )
     return parsed
+
+
+def _parse_block_bound(value, flag):
+    """解析 --min-block / --max-block：空值、空白、非十进制文本、正负号
+    或小数点都在读取数据文件前报 invalid_block_filter；前导零合法。"""
+    if not isinstance(value, str) or _AMOUNT_RE.fullmatch(value) is None:
+        raise InvalidBlockFilterError(
+            "%s 必须为非负十进制整数区块高度" % flag, None
+        )
+    return int(value)
 
 
 def build_parser():
@@ -298,7 +318,19 @@ def _filters_from_args(args, parser):
     # 倒置校验集中在 normalize_filters，抛 InvalidTimeRangeError；
     # 空白值与 address/from/to 冲突也在此抛 InvalidFilterError；
     # 金额格式非法抛 InvalidAmountFilterError、区间倒置抛
-    # InvalidAmountRangeError，均发生在读取数据文件之前
+    # InvalidAmountRangeError；区块边界非十进制文本抛
+    # InvalidBlockFilterError、区间倒置抛 InvalidBlockRangeError，
+    # 均发生在读取数据文件之前
+    min_block = (
+        _parse_block_bound(args.min_block, "--min-block")
+        if args.min_block is not None
+        else None
+    )
+    max_block = (
+        _parse_block_bound(args.max_block, "--max-block")
+        if args.max_block is not None
+        else None
+    )
     return normalize_filters(
         address=args.address,
         method=args.method,
@@ -308,6 +340,8 @@ def _filters_from_args(args, parser):
         to_address=args.to_address,
         min_amount=args.min_amount,
         max_amount=args.max_amount,
+        min_block=min_block,
+        max_block=max_block,
     )
 
 

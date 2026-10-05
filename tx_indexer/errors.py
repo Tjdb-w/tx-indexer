@@ -55,6 +55,19 @@ class InvalidAmountRangeError(TxIndexerError):
     error = "invalid_amount_range"
 
 
+class InvalidBlockFilterError(TxIndexerError):
+    """区块高度筛选值非法（空值、空白、非十进制文本、正负号、小数点、
+    布尔值或非整数值）。"""
+
+    error = "invalid_block_filter"
+
+
+class InvalidBlockRangeError(TxIndexerError):
+    """区块高度区间倒置（合法的 min_block 大于 max_block）。"""
+
+    error = "invalid_block_range"
+
+
 class InvalidFilterError(TxIndexerError):
     """筛选条件非法（值为空白）或组合冲突（address 与 from/to 并用）。"""
 
