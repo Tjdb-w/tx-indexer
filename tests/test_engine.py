@@ -4,6 +4,8 @@ import unittest
 
 from tx_indexer.engine import TxIndexer, normalize_filters
 from tx_indexer.errors import (
+    InvalidAmountFilterError,
+    InvalidAmountRangeError,
     InvalidBucketSizeError,
     InvalidCursorError,
     InvalidFilterError,
@@ -1660,6 +1662,286 @@ class AddressTimeStatsTest(unittest.TestCase):
         self.assertEqual(groups["a"]["avg_amount"], str(int(total) // 2))
         self.assertEqual(groups["b"]["total_amount"], total)
         self.assertEqual(groups["b"]["avg_amount"], str(int(total) // 2))
+
+
+class AmountFilterTest(unittest.TestCase):
+    def setUp(self):
+        self.records = [
+            rec("h0", 1, 0, "alice", "bob", "transfer", "0"),
+            rec("h1", 1, 10, "alice", "bob", "transfer", "10"),
+            rec("h2", 2, 20, "bob", "alice", "approve", "20"),
+            rec("h3", 2, 30, "alice", "carol", "transfer", "30"),
+            rec("h4", 3, 40, "bob", "dave", "transfer", "100"),
+        ]
+        self.idx = TxIndexer(self.records)
+
+    def test_query_closed_interval_inclusive_both_ends(self):
+        result = self.idx.query(
+            normalize_filters(min_amount="10", max_amount="30")
+        )
+        self.assertEqual(hashes(result), ["h1", "h2", "h3"])
+        self.assertEqual(result["total"], 3)
+        self.assertIsNone(result["next_cursor"])
+
+    def test_query_single_bound_unbounded_other_side(self):
+        self.assertEqual(
+            hashes(self.idx.query(normalize_filters(min_amount="20"))),
+            ["h2", "h3", "h4"],
+        )
+        self.assertEqual(
+            hashes(self.idx.query(normalize_filters(max_amount="20"))),
+            ["h0", "h1", "h2"],
+        )
+
+    def test_query_zero_is_valid_bound(self):
+        result = self.idx.query(
+            normalize_filters(min_amount="0", max_amount="0")
+        )
+        self.assertEqual(hashes(result), ["h0"])
+
+    def test_query_leading_zeros_numeric_equivalence(self):
+        result = self.idx.query(
+            normalize_filters(min_amount="0010", max_amount="030")
+        )
+        self.assertEqual(hashes(result), ["h1", "h2", "h3"])
+
+    def test_query_intersects_with_other_filters(self):
+        result = self.idx.query(
+            normalize_filters(
+                address="alice", method="transfer",
+                start_time=0, end_time=100,
+                min_amount="10", max_amount="10",
+            )
+        )
+        self.assertEqual(hashes(result), ["h1"])
+
+    def test_query_empty_result_shape_unchanged(self):
+        result = self.idx.query(
+            normalize_filters(min_amount="1000"), page_size=2
+        )
+        self.assertEqual(result["transactions"], [])
+        self.assertEqual(result["total"], 0)
+        self.assertIsNone(result["next_cursor"])
+
+    def test_stats_recomputed_on_matched_only(self):
+        stats = self.idx.stats(
+            normalize_filters(min_amount="20", max_amount="100")
+        )
+        self.assertEqual(stats, {
+            "total_count": 3,
+            "total_amount": "150",
+            "min_amount": "20",
+            "max_amount": "100",
+            "avg_amount": "50",
+        })
+
+    def test_stats_empty_shape_unchanged(self):
+        stats = self.idx.stats(normalize_filters(max_amount="0"))
+        self.assertEqual(stats["total_count"], 1)
+        self.assertEqual(stats["total_amount"], "0")
+        self.assertEqual(stats["min_amount"], "0")
+        self.assertEqual(stats["max_amount"], "0")
+        self.assertEqual(stats["avg_amount"], "0")
+        none_match = self.idx.stats(normalize_filters(min_amount="999"))
+        self.assertEqual(none_match, {
+            "total_count": 0,
+            "total_amount": "0",
+            "min_amount": None,
+            "max_amount": None,
+            "avg_amount": None,
+        })
+
+    def test_grouped_stats_all_scope_amount_filter(self):
+        f = normalize_filters(min_amount="20")
+        method = self.idx.method_stats(f)
+        self.assertEqual(
+            [g["method"] for g in method["groups"]],
+            ["transfer", "approve"],
+        )
+        self.assertEqual(method["total_groups"], 2)
+        by_method = {g["method"]: g for g in method["groups"]}
+        self.assertEqual(by_method["approve"]["total_amount"], "20")
+        self.assertEqual(by_method["transfer"]["total_amount"], "130")
+
+        addresses = self.idx.address_stats(f)
+        self.assertEqual(addresses["total_groups"], 4)
+        amounts = {g["address"]: g["total_amount"]
+                   for g in addresses["groups"]}
+        self.assertEqual(amounts,
+                         {"alice": "50", "bob": "120",
+                          "carol": "30", "dave": "100"})
+
+        counterparties = self.idx.counterparty_stats(
+            normalize_filters(address="alice", min_amount="20")
+        )
+        self.assertEqual(
+            [g["counterparty"] for g in counterparties["groups"]],
+            ["carol", "bob"],
+        )
+        cp_amounts = {g["counterparty"]: g["total_amount"]
+                      for g in counterparties["groups"]}
+        self.assertEqual(cp_amounts, {"carol": "30", "bob": "20"})
+
+        buckets = self.idx.time_stats(f, bucket_size=100)
+        self.assertEqual(buckets["total_groups"], 1)
+        self.assertEqual(buckets["groups"][0]["total_amount"], "150")
+
+        pairs = self.idx.pair_stats(f)
+        self.assertEqual(pairs["total_groups"], 3)
+        pair_amounts = {
+            (g["from_address"], g["to_address"]): g["total_amount"]
+            for g in pairs["groups"]
+        }
+        self.assertEqual(pair_amounts, {
+            ("bob", "dave"): "100",
+            ("alice", "carol"): "30",
+            ("bob", "alice"): "20",
+        })
+
+        ats = self.idx.address_time_stats(f, bucket_size=100)
+        self.assertEqual(ats["total_groups"], 4)
+
+    def test_grouped_stats_empty_shape_unchanged(self):
+        f = normalize_filters(min_amount="999")
+        self.assertEqual(self.idx.method_stats(f)["groups"], [])
+        self.assertEqual(self.idx.method_stats(f)["total_groups"], 0)
+        self.assertIsNone(self.idx.method_stats(f)["next_cursor"])
+        self.assertEqual(self.idx.address_stats(f)["groups"], [])
+        cp = self.idx.counterparty_stats(
+            normalize_filters(address="alice", min_amount="999"))
+        self.assertEqual(cp["groups"], [])
+        self.assertEqual(cp["address"], "alice")
+        self.assertEqual(self.idx.time_stats(f, 60)["groups"], [])
+        self.assertEqual(self.idx.pair_stats(f)["groups"], [])
+        self.assertEqual(self.idx.address_time_stats(f, 60)["groups"], [])
+
+    def test_invalid_amount_filter_values(self):
+        bad_values = (
+            "", " ", "-1", "+1", "1.0", ".5", "1e3", "0x10",
+            " 10", "10 ", "１０", "1_000",
+        )
+        # None 表示未给定，不是非法值
+        self.assertIsNone(normalize_filters(min_amount=None)["min_amount"])
+        for bad in bad_values:
+            with self.assertRaises(InvalidAmountFilterError) as ctx_min:
+                normalize_filters(min_amount=bad)
+            self.assertNotIsInstance(
+                ctx_min.exception, ValueError,
+                "金额非法不能回退为 ValueError：%r" % bad,
+            )
+            with self.assertRaises(InvalidAmountFilterError):
+                normalize_filters(max_amount=bad)
+
+    def test_invalid_amount_filter_non_string(self):
+        for bad in (10, 10.0, True, b"10", ["10"], {"v": 1}, object()):
+            with self.assertRaises(InvalidAmountFilterError) as ctx:
+                normalize_filters(min_amount=bad)
+            self.assertNotIsInstance(ctx.exception, ValueError)
+            with self.assertRaises(InvalidAmountFilterError):
+                normalize_filters(max_amount=bad)
+
+    def test_amount_range_inverted(self):
+        with self.assertRaises(InvalidAmountRangeError) as ctx:
+            normalize_filters(min_amount="11", max_amount="10")
+        self.assertNotIsInstance(ctx.exception, ValueError)
+        self.assertEqual(ctx.exception.error, "invalid_amount_range")
+        # 相等是合法闭区间
+        filters = normalize_filters(min_amount="10", max_amount="10")
+        self.assertEqual(filters["min_amount"], "10")
+        self.assertEqual(filters["max_amount"], "10")
+
+    def test_range_check_uses_numeric_value_with_leading_zeros(self):
+        # 数值等价：0011 == 11 > 10，倒置；0010 == 10，不倒置
+        with self.assertRaises(InvalidAmountRangeError):
+            normalize_filters(min_amount="0011", max_amount="10")
+        filters = normalize_filters(min_amount="0010", max_amount="010")
+        self.assertEqual(filters["min_amount"], "10")
+        self.assertEqual(filters["max_amount"], "10")
+
+    def test_pagination_bound_to_amount(self):
+        filters = normalize_filters(min_amount="20")
+        collected = []
+        cursor = None
+        while True:
+            page = self.idx.query(filters, page_size=1, cursor=cursor)
+            self.assertEqual(page["total"], 3)
+            collected.extend(hashes(page))
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(collected, ["h2", "h3", "h4"])
+
+    def test_cursor_rejects_changed_amount_bounds(self):
+        page = self.idx.query(
+            normalize_filters(min_amount="20"), page_size=1
+        )
+        cursor = page["next_cursor"]
+        self.assertIsNotNone(cursor)
+        # 改下界
+        with self.assertRaises(InvalidCursorError):
+            self.idx.query(
+                normalize_filters(min_amount="10"), page_size=1,
+                cursor=cursor,
+            )
+        # 增上界
+        with self.assertRaises(InvalidCursorError):
+            self.idx.query(
+                normalize_filters(min_amount="20", max_amount="100"),
+                page_size=1, cursor=cursor,
+            )
+        # 删除边界
+        with self.assertRaises(InvalidCursorError):
+            self.idx.query(
+                normalize_filters(), page_size=1, cursor=cursor
+            )
+        # 无金额游标不能在有金额筛选下续用
+        no_amount = self.idx.query(normalize_filters(), page_size=1)
+        with self.assertRaises(InvalidCursorError):
+            self.idx.query(
+                normalize_filters(max_amount="30"), page_size=1,
+                cursor=no_amount["next_cursor"],
+            )
+
+    def test_cursor_allows_leading_zero_only_change(self):
+        page1 = self.idx.query(
+            normalize_filters(min_amount="20"), page_size=1
+        )
+        cursor = page1["next_cursor"]
+        # 只调整前导零：数值等价，可继续翻页
+        page2 = self.idx.query(
+            normalize_filters(min_amount="020"), page_size=1,
+            cursor=cursor,
+        )
+        self.assertEqual(hashes(page2), ["h3"])
+
+    def test_grouped_stats_cursor_bound_to_amount(self):
+        page = self.idx.method_stats(
+            normalize_filters(min_amount="20"), page_size=1
+        )
+        cursor = page["next_cursor"]
+        with self.assertRaises(InvalidCursorError):
+            self.idx.method_stats(
+                normalize_filters(min_amount="10"), page_size=1,
+                cursor=cursor,
+            )
+        # 前导零等价可续页
+        again = self.idx.method_stats(
+            normalize_filters(min_amount="020"), page_size=1,
+            cursor=cursor,
+        )
+        self.assertEqual([g["method"] for g in again["groups"]], ["approve"])
+
+    def test_big_amounts_exact_decimal_comparison(self):
+        big = "123456789012345678901234567890"
+        bigger = "123456789012345678901234567891"
+        idx = TxIndexer([
+            rec("x", 1, 1, "a", "b", "m", big),
+            rec("y", 2, 2, "a", "b", "m", bigger),
+        ])
+        result = idx.query(normalize_filters(min_amount=bigger))
+        self.assertEqual(hashes(result), ["y"])
+        stats = idx.stats(normalize_filters(min_amount=big, max_amount=big))
+        self.assertEqual(stats["total_amount"], big)
 
 
 if __name__ == "__main__":

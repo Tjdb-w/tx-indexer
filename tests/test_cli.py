@@ -1325,5 +1325,188 @@ class CliTest(unittest.TestCase):
         self.assertEqual(payload["input_line"], 2)
 
 
+class AmountFilterCliTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "data.jsonl")
+        with open(self.path, "w", encoding="utf-8") as fh:
+            for obj in DATA_LINES:
+                fh.write(json.dumps(obj) + "\n")
+        self._stdout, self._stderr = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+
+    def tearDown(self):
+        sys.stdout, sys.stderr = self._stdout, self._stderr
+        self.tmp.cleanup()
+
+    def _run(self, argv):
+        sys.stdout.seek(0)
+        sys.stdout.truncate(0)
+        sys.stderr.seek(0)
+        sys.stderr.truncate(0)
+        code = main(argv)
+        out = sys.stdout.getvalue()
+        err = sys.stderr.getvalue()
+        return code, json.loads(out) if out.strip() else None, err
+
+    def test_query_amount_closed_interval(self):
+        code, page, err = self._run(
+            ["query", self.path, "--min-amount", "10",
+             "--max-amount", "21"])
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual([t["tx_hash"] for t in page["transactions"]],
+                         ["h1", "h2"])
+        self.assertEqual(page["total"], 2)
+
+    def test_query_single_bound_and_zero(self):
+        code, page, _ = self._run(
+            ["query", self.path, "--max-amount", "10"])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page["transactions"]],
+                         ["h1", "h3"])
+
+        code, page, _ = self._run(
+            ["query", self.path, "--min-amount", "21"])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page["transactions"]], ["h2"])
+
+        code, page, _ = self._run(
+            ["query", self.path, "--min-amount", "0",
+             "--max-amount", "0"])
+        self.assertEqual(code, 0)
+        self.assertEqual(page["transactions"], [])
+        self.assertEqual(page["total"], 0)
+
+    def test_leading_zeros_numeric_equivalence(self):
+        code, page, _ = self._run(
+            ["query", self.path, "--min-amount", "0010",
+             "--max-amount", "021"])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page["transactions"]],
+                         ["h1", "h2"])
+
+    def test_amount_intersects_other_filters(self):
+        code, page, _ = self._run([
+            "query", self.path,
+            "--address", "alice", "--method", "transfer",
+            "--min-amount", "6", "--max-amount", "10",
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page["transactions"]], ["h1"])
+
+    def test_stats_and_groups_recomputed(self):
+        code, stats, _ = self._run(
+            ["stats", self.path, "--min-amount", "10"])
+        self.assertEqual(code, 0)
+        self.assertEqual(stats, {
+            "total_count": 2,
+            "total_amount": "31",
+            "min_amount": "10",
+            "max_amount": "21",
+            "avg_amount": "15",
+        })
+
+        for command, extra in (
+            ("method-stats", []),
+            ("address-stats", []),
+            ("counterparty-stats", ["--address", "alice"]),
+            ("time-stats", ["--bucket-size", "60"]),
+            ("pair-stats", []),
+            ("address-time-stats", ["--bucket-size", "60"]),
+        ):
+            code, result, _ = self._run(
+                [command, self.path, "--min-amount", "100"] + extra)
+            self.assertEqual(code, 0)
+            self.assertEqual(result["groups"], [])
+            self.assertEqual(result["total_groups"], 0)
+            self.assertIsNone(result["next_cursor"])
+
+    def test_invalid_amount_filter_exit_2_single_line_json(self):
+        missing = os.path.join(self.tmp.name, "missing.jsonl")
+        bad_values = ("", " ", "-1", "+1", "1.0", ".5", "abc",
+                      "1e3", "0x1", " 10", "1_0")
+        for flag in ("--min-amount", "--max-amount"):
+            for bad in bad_values:
+                code, out, err = self._run(
+                    ["query", missing, flag, bad])
+                self.assertEqual(code, 2, (flag, bad))
+                self.assertIsNone(out)
+                # stderr 为单行 JSON
+                self.assertEqual(err.strip().count("\n"), 0, (flag, bad))
+                payload = json.loads(err)
+                self.assertEqual(payload["error"], "invalid_amount_filter")
+                self.assertIsNone(payload["input_line"])
+
+    def test_invalid_amount_range_exit_2(self):
+        missing = os.path.join(self.tmp.name, "missing.jsonl")
+        code, out, err = self._run([
+            "query", missing,
+            "--min-amount", "11", "--max-amount", "10"])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        self.assertEqual(err.strip().count("\n"), 0)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_amount_range")
+        self.assertIsNone(payload["input_line"])
+
+        # 前导零数值比较：0011 > 10 倒置
+        code, _, err = self._run([
+            "query", missing,
+            "--min-amount", "0011", "--max-amount", "10"])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(err)["error"], "invalid_amount_range")
+
+        # 相等为合法闭区间（前导零等价）：正常查询而非金额报错
+        code, page, err = self._run([
+            "query", self.path,
+            "--min-amount", "10", "--max-amount", "010"])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page["transactions"]], ["h1"])
+
+    def test_cursor_bound_to_amount_bounds(self):
+        code, page1, _ = self._run([
+            "query", self.path, "--min-amount", "5", "--page-size", "1"])
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(page1["next_cursor"])
+
+        # 相同边界续页正常
+        code, page2, _ = self._run([
+            "query", self.path, "--min-amount", "5", "--page-size", "1",
+            "--cursor", page1["next_cursor"]])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page2["transactions"]], ["h2"])
+
+        # 只调整前导零可继续翻页
+        code, page2, _ = self._run([
+            "query", self.path, "--min-amount", "005", "--page-size", "1",
+            "--cursor", page1["next_cursor"]])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page2["transactions"]], ["h2"])
+
+        # 改变/增加/删除任一边界 → invalid_cursor
+        for extra in (
+            ["--min-amount", "10"],
+            ["--min-amount", "5", "--max-amount", "21"],
+            [],
+        ):
+            code, out, err = self._run(
+                ["query", self.path, "--page-size", "1",
+                 "--cursor", page1["next_cursor"]] + extra)
+            self.assertEqual(code, 2)
+            self.assertIsNone(out)
+            self.assertEqual(json.loads(err)["error"], "invalid_cursor")
+
+    def test_old_cursor_valid_without_amount_bounds(self):
+        # 未指定金额边界时签发与续用都不带金额，行为与既有游标一致
+        code, page1, _ = self._run(
+            ["query", self.path, "--page-size", "1"])
+        code, page2, _ = self._run([
+            "query", self.path, "--page-size", "1",
+            "--cursor", page1["next_cursor"]])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page2["transactions"]], ["h2"])
+
+
 if __name__ == "__main__":
     unittest.main()

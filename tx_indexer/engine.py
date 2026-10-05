@@ -6,6 +6,9 @@
 - ``from_address`` / ``to_address`` / ``method``：值集合，集合内部
   任一命中即可；可重复给定，重复值等同一个条件
 - ``start_time`` / ``end_time``：时间窗，左闭右闭（UTC 秒）
+- ``min_amount`` / ``max_amount``：金额闭区间（按十进制整数数值比较，
+  交易 amount 的非负十进制整数字符串形式；前导零不改变数值含义），
+  只给一端时另一端不限制
 
 query 排序：block_number 升序，同高度按 tx_hash 升序。
 method-stats 排序：total_amount 降序、total_count 降序、method 码点升序。
@@ -48,11 +51,14 @@ from .cursor import (
     encode_time_stats_cursor,
 )
 from .errors import (
+    InvalidAmountFilterError,
+    InvalidAmountRangeError,
     InvalidBucketSizeError,
     InvalidFilterError,
     InvalidPageSizeError,
     InvalidTimeRangeError,
 )
+from .loader import _AMOUNT_RE
 
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 1000
@@ -86,12 +92,29 @@ def _normalize_value_set(name, values):
     return frozenset(result)
 
 
+def _normalize_amount_bound(name, value):
+    """校验金额区间端点并规范化为无前导零的十进制整数字符串。
+
+    金额筛选沿用交易 amount 格式：必须是非负十进制整数字符串，不接受
+    非字符串、空字符串、正负号或小数点；前导零不改变数值含义。
+    """
+    if not isinstance(value, str) or _AMOUNT_RE.fullmatch(value) is None:
+        raise InvalidAmountFilterError(
+            "%s 必须为非负十进制整数字符串" % name, None
+        )
+    return str(int(value))
+
+
 def normalize_filters(address=None, method=None, start_time=None, end_time=None,
-                      from_address=None, to_address=None):
+                      from_address=None, to_address=None, min_amount=None,
+                      max_amount=None):
     """校验并归一化筛选条件。
 
     ``method`` / ``from_address`` / ``to_address`` 接受单个字符串或
     字符串迭代器，归一化为去重集合（frozenset）；不给或为空则为 None。
+    ``min_amount`` / ``max_amount`` 接受非负十进制整数字符串，按数值
+    比较、闭区间，不给为 None；非法值抛 InvalidAmountFilterError，
+    最小值数值大于最大值抛 InvalidAmountRangeError。
     """
     if address is not None and (
         not isinstance(address, str) or address.strip() == ""
@@ -117,6 +140,22 @@ def normalize_filters(address=None, method=None, start_time=None, end_time=None,
             % (start_time, end_time),
             None,
         )
+    min_bound = (
+        _normalize_amount_bound("min_amount", min_amount)
+        if min_amount is not None else None
+    )
+    max_bound = (
+        _normalize_amount_bound("max_amount", max_amount)
+        if max_amount is not None else None
+    )
+    if min_bound is not None and max_bound is not None and (
+        int(min_bound) > int(max_bound)
+    ):
+        raise InvalidAmountRangeError(
+            "金额区间倒置：min_amount(%s) 大于 max_amount(%s)"
+            % (min_bound, max_bound),
+            None,
+        )
     return {
         "address": address,
         "from_address": from_set,
@@ -124,6 +163,8 @@ def normalize_filters(address=None, method=None, start_time=None, end_time=None,
         "method": method_set,
         "start_time": start_time,
         "end_time": end_time,
+        "min_amount": min_bound,
+        "max_amount": max_bound,
     }
 
 
@@ -151,6 +192,11 @@ def _matches(record, filters):
     if filters["start_time"] is not None and ts < filters["start_time"]:
         return False
     if filters["end_time"] is not None and ts > filters["end_time"]:
+        return False
+    amount = int(record["amount"])
+    if filters["min_amount"] is not None and amount < int(filters["min_amount"]):
+        return False
+    if filters["max_amount"] is not None and amount > int(filters["max_amount"]):
         return False
     return True
 

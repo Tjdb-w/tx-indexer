@@ -510,6 +510,96 @@ class QueryTest(unittest.TestCase):
         self.assertEqual(heights(second), [2, 3, 4, 5])
         self.assertEqual(second["total"], 6)
 
+    def test_amount_filter_scoped_per_chain(self):
+        # chain-a: 5/7/100，chain-b: 500
+        result = self.manager.query(
+            "chain-a", normalize_filters(min_amount="7", max_amount="100")
+        )
+        self.assertEqual(hashes(result), ["a2", "a3"])
+        only_high = self.manager.query(
+            "chain-a", normalize_filters(min_amount="100")
+        )
+        self.assertEqual(hashes(only_high), ["a3"])
+        # 金额筛选同样按链隔离：chain-b 的 500 不受影响
+        b = self.manager.query(
+            "chain-b", normalize_filters(min_amount="500")
+        )
+        self.assertEqual(hashes(b), ["a1"])
+        b_none = self.manager.query(
+            "chain-b", normalize_filters(max_amount="499")
+        )
+        self.assertEqual(b_none["total"], 0)
+        self.assertIsNone(b_none["next_cursor"])
+
+    def test_amount_filter_unknown_chain_empty(self):
+        result = self.manager.query(
+            "ghost", normalize_filters(min_amount="1")
+        )
+        self.assertEqual(result, {
+            "transactions": [],
+            "total": 0,
+            "next_cursor": None,
+        })
+
+    def test_invalid_amount_filter_raises(self):
+        from tx_indexer.errors import (
+            InvalidAmountFilterError,
+            InvalidAmountRangeError,
+        )
+        for bad in ("", "-1", "1.0", 5, True):
+            with self.assertRaises(InvalidAmountFilterError):
+                self.manager.query(
+                    "chain-a", normalize_filters(min_amount=bad)
+                )
+        with self.assertRaises(InvalidAmountRangeError):
+            self.manager.query(
+                "chain-a",
+                normalize_filters(min_amount="8", max_amount="7"),
+            )
+
+    def test_cursor_bound_to_amount_bounds(self):
+        first = self.manager.query(
+            "chain-a", normalize_filters(min_amount="7"), page_size=1
+        )
+        self.assertIsNotNone(first["next_cursor"])
+        # 前导零等价可续页
+        second = self.manager.query(
+            "chain-a", normalize_filters(min_amount="007"), page_size=1,
+            cursor=first["next_cursor"],
+        )
+        self.assertEqual(hashes(second), ["a3"])
+        # 改变/删除边界 → 拒绝
+        for changed in (
+            normalize_filters(min_amount="5"),
+            normalize_filters(min_amount="7", max_amount="100"),
+            normalize_filters(),
+        ):
+            with self.assertRaises(InvalidCursorError):
+                self.manager.query(
+                    "chain-a", changed, page_size=1,
+                    cursor=first["next_cursor"],
+                )
+
+    def test_amount_cursor_bound_to_chain(self):
+        # 金额边界与 chain_id 共同绑定多链游标
+        first = self.manager.query(
+            "chain-a", normalize_filters(min_amount="5"), page_size=1
+        )
+        with self.assertRaises(InvalidCursorError):
+            self.manager.query(
+                "chain-b", normalize_filters(min_amount="5"),
+                cursor=first["next_cursor"],
+            )
+        # 多链金额游标仍不能与单索引 query 游标互用
+        from tx_indexer.cursor import encode_cursor
+
+        token = encode_cursor(normalize_filters(min_amount="5"), 0, "a1")
+        with self.assertRaises(InvalidCursorError):
+            self.manager.query(
+                "chain-a", normalize_filters(min_amount="5"),
+                cursor=token,
+            )
+
 
 class StatsTest(unittest.TestCase):
     def setUp(self):
@@ -574,6 +664,43 @@ class StatsTest(unittest.TestCase):
         with self.assertRaises(InvalidTimeRangeError):
             self.manager.stats(
                 "chain-a", normalize_filters(start_time=9, end_time=1)
+            )
+
+    def test_stats_amount_filter(self):
+        # chain-a: 5/7/100，闭区间 [7, 100]
+        stats = self.manager.stats(
+            "chain-a", normalize_filters(min_amount="7", max_amount="100")
+        )
+        self.assertEqual(stats["total_count"], 2)
+        self.assertEqual(stats["total_amount"], "107")
+        self.assertEqual(stats["min_amount"], "7")
+        self.assertEqual(stats["max_amount"], "100")
+        self.assertEqual(stats["avg_amount"], "53")
+        # 未开始的链继续返回无匹配统计
+        ghost = self.manager.stats(
+            "ghost", normalize_filters(min_amount="1")
+        )
+        self.assertEqual(ghost, {
+            "total_count": 0,
+            "total_amount": "0",
+            "min_amount": None,
+            "max_amount": None,
+            "avg_amount": None,
+        })
+
+    def test_stats_invalid_amount_raises(self):
+        from tx_indexer.errors import (
+            InvalidAmountFilterError,
+            InvalidAmountRangeError,
+        )
+        with self.assertRaises(InvalidAmountFilterError):
+            self.manager.stats(
+                "chain-a", normalize_filters(min_amount="1.0")
+            )
+        with self.assertRaises(InvalidAmountRangeError):
+            self.manager.stats(
+                "chain-a",
+                normalize_filters(min_amount="101", max_amount="100"),
             )
 
 

@@ -43,6 +43,18 @@ class InvalidTimeRangeError(TxIndexerError):
     error = "invalid_time_range"
 
 
+class InvalidAmountFilterError(TxIndexerError):
+    """金额筛选值非法（非字符串、空字符串、带正负号或小数点等不符 amount 格式）。"""
+
+    error = "invalid_amount_filter"
+
+
+class InvalidAmountRangeError(TxIndexerError):
+    """金额区间倒置（合法的 min_amount 数值大于 max_amount）。"""
+
+    error = "invalid_amount_range"
+
+
 class InvalidFilterError(TxIndexerError):
     """筛选条件非法（值为空白）或组合冲突（address 与 from/to 并用）。"""
 

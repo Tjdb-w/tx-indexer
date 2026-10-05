@@ -641,12 +641,15 @@ class MultiChainReplayManager:
         """按链分页查询，返回 ``{transactions, total, next_cursor}``。
 
         筛选、左闭右闭时间窗、排序、返回结构沿用
-        :meth:`TxIndexer.query`；游标额外绑定 chain_id，跨链或改筛选
+        :meth:`TxIndexer.query`（含 ``min_amount`` / ``max_amount``
+        金额闭区间筛选）；游标额外绑定 chain_id，跨链或改筛选
         复用抛 :class:`~tx_indexer.errors.InvalidCursorError`，
         page_size 非法抛
         :class:`~tx_indexer.errors.InvalidPageSizeError`，筛选非法抛
         :class:`~tx_indexer.errors.InvalidFilterError` /
-        :class:`~tx_indexer.errors.InvalidTimeRangeError`。尚未开始的
+        :class:`~tx_indexer.errors.InvalidTimeRangeError` /
+        :class:`~tx_indexer.errors.InvalidAmountFilterError` /
+        :class:`~tx_indexer.errors.InvalidAmountRangeError`。尚未开始的
         链按空索引处理：transactions 为空、total 为 0、next_cursor 为
         None（携带与该链及筛选不匹配的游标仍抛 InvalidCursorError）。
         """

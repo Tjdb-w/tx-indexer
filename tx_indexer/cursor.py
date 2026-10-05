@@ -10,6 +10,11 @@
 筛选快照中集合类条件（from_address / to_address / method）统一存为
 排序后的列表；解码比较时同样归一化，因此旧版游标（method 为单个字符串、
 无集合字段、无命令字段）在 query 下筛选等价时仍可续页。
+
+金额区间端点（min_amount / max_amount）统一存为无前导零的十进制整数
+字符串并按数值等价比较：只调整前导零可继续翻页，增加、删除或改变任一
+边界后复用旧游标报 InvalidCursorError；未携带金额字段的旧游标只在
+未指定金额边界时继续有效。
 """
 
 import base64
@@ -17,6 +22,7 @@ import binascii
 import json
 
 from .errors import InvalidCursorError
+from .loader import _AMOUNT_RE
 
 _CURSOR_VERSION = 1
 
@@ -43,8 +49,19 @@ def _as_sorted_list(value):
     return sorted(value)
 
 
+def _as_canonical_amount(value):
+    """金额端点的规范形：None → None，否则必须为非负十进制整数字符串，
+    去掉前导零后按数值等价表示（``"007"`` 与 ``"7"`` 等价）。"""
+    if value is None:
+        return None
+    if not isinstance(value, str) or _AMOUNT_RE.fullmatch(value) is None:
+        raise ValueError("金额边界必须为非负十进制整数字符串")
+    return str(int(value))
+
+
 def _canonical_filters(filters):
-    """提取用于游标绑定比对的筛选快照（集合归一化为排序列表）。"""
+    """提取用于游标绑定比对的筛选快照（集合归一化为排序列表、金额归一化
+    为无前导零字符串）。"""
     return {
         "address": filters.get("address"),
         "from_address": _as_sorted_list(filters.get("from_address")),
@@ -52,6 +69,8 @@ def _canonical_filters(filters):
         "method": _as_sorted_list(filters.get("method")),
         "start_time": filters.get("start_time"),
         "end_time": filters.get("end_time"),
+        "min_amount": _as_canonical_amount(filters.get("min_amount")),
+        "max_amount": _as_canonical_amount(filters.get("max_amount")),
     }
 
 

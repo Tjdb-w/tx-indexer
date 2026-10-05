@@ -13,7 +13,8 @@
     tx-indexer address-time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
 
 领域错误（invalid_transaction / duplicate_transaction / invalid_time_range /
-invalid_page_size / invalid_cursor / invalid_filter / invalid_bucket_size）
+invalid_page_size / invalid_cursor / invalid_filter / invalid_bucket_size /
+invalid_amount_filter / invalid_amount_range）
 以 JSON 对象输出到 stderr，退出码 2：
 
     {"error": "...", "message": "...", "input_line": 12}
@@ -55,6 +56,14 @@ def _add_filter_args(parser):
     )
     parser.add_argument("--start-time", help="时间窗起点（UTC 秒，含）")
     parser.add_argument("--end-time", help="时间窗终点（UTC 秒，含）")
+    parser.add_argument(
+        "--min-amount",
+        help="金额区间下界（非负十进制整数，含端点，按数值比较）",
+    )
+    parser.add_argument(
+        "--max-amount",
+        help="金额区间上界（非负十进制整数，含端点，按数值比较）",
+    )
 
 
 def _parse_time(value, flag, parser):
@@ -238,8 +247,9 @@ def _filters_from_args(args, parser):
         else None
     )
     # 倒置校验集中在 normalize_filters，抛 InvalidTimeRangeError；
-    # 空白值与 address/from/to 冲突也在此抛 InvalidFilterError，
-    # 均发生在读取数据文件之前
+    # 空白值与 address/from/to 冲突也在此抛 InvalidFilterError；
+    # 金额格式非法抛 InvalidAmountFilterError、区间倒置抛
+    # InvalidAmountRangeError，均发生在读取数据文件之前
     return normalize_filters(
         address=args.address,
         method=args.method,
@@ -247,6 +257,8 @@ def _filters_from_args(args, parser):
         end_time=end_time,
         from_address=args.from_address,
         to_address=args.to_address,
+        min_amount=args.min_amount,
+        max_amount=args.max_amount,
     )
 
 
