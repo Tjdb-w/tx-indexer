@@ -9,6 +9,10 @@
 - ``min_amount`` / ``max_amount``：金额闭区间（按十进制整数数值比较，
   交易 amount 的非负十进制整数字符串形式；前导零不改变数值含义），
   只给一端时另一端不限制
+- ``min_block`` / ``max_block``：区块高度闭区间（非负整数，含端点，
+  ``block_number >= min_block`` 且 ``<= max_block``），只给一端时
+  另一端不限制；非法值抛 InvalidBlockFilterError，最小值大于最大值
+  抛 InvalidBlockRangeError
 
 query 排序：block_number 升序，同高度按 tx_hash 升序。
 method-stats 排序：total_amount 降序、total_count 降序、method 码点升序。
@@ -62,6 +66,8 @@ from .errors import (
     InvalidAggregationRange,
     InvalidAmountFilterError,
     InvalidAmountRangeError,
+    InvalidBlockFilterError,
+    InvalidBlockRangeError,
     InvalidBucketSizeError,
     InvalidFilterError,
     InvalidPageSizeError,
@@ -125,9 +131,29 @@ def _normalize_amount_bound(name, value):
     return str(int(value))
 
 
+def _normalize_block_bound(name, value):
+    """校验区块高度区间端点：必须是非负整数（bool 不是整数）。
+
+    空值（None）表示未给定，由调用方在外层处理；其余非 int、布尔值或
+    负数都抛 InvalidBlockFilterError。CLI 文本（只接受非负十进制数字，
+    拒绝空白、正负号、小数点）在入口处先行解析为 int，不在此处理。
+    """
+    if value is None:
+        return None
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+    ):
+        raise InvalidBlockFilterError(
+            "%s 必须为非负整数" % name, None
+        )
+    return value
+
+
 def normalize_filters(address=None, method=None, start_time=None, end_time=None,
                       from_address=None, to_address=None, min_amount=None,
-                      max_amount=None):
+                      max_amount=None, min_block=None, max_block=None):
     """校验并归一化筛选条件。
 
     ``method`` / ``from_address`` / ``to_address`` 接受单个字符串或
@@ -135,6 +161,10 @@ def normalize_filters(address=None, method=None, start_time=None, end_time=None,
     ``min_amount`` / ``max_amount`` 接受非负十进制整数字符串，按数值
     比较、闭区间，不给为 None；非法值抛 InvalidAmountFilterError，
     最小值数值大于最大值抛 InvalidAmountRangeError。
+    ``min_block`` / ``max_block`` 接受非负整数（Python 调用），按
+    ``block_number >= min_block`` 且 ``<= max_block`` 闭区间过滤，不
+    给为 None；非整数（含布尔、浮点、字符串）抛 InvalidBlockFilterError，
+    最小值大于最大值抛 InvalidBlockRangeError。
     """
     if address is not None and (
         not isinstance(address, str) or address.strip() == ""
@@ -176,6 +206,16 @@ def normalize_filters(address=None, method=None, start_time=None, end_time=None,
             % (min_bound, max_bound),
             None,
         )
+    min_block_bound = _normalize_block_bound("min_block", min_block)
+    max_block_bound = _normalize_block_bound("max_block", max_block)
+    if min_block_bound is not None and max_block_bound is not None and (
+        min_block_bound > max_block_bound
+    ):
+        raise InvalidBlockRangeError(
+            "区块高度区间倒置：min_block(%d) 大于 max_block(%d)"
+            % (min_block_bound, max_block_bound),
+            None,
+        )
     return {
         "address": address,
         "from_address": from_set,
@@ -185,6 +225,8 @@ def normalize_filters(address=None, method=None, start_time=None, end_time=None,
         "end_time": end_time,
         "min_amount": min_bound,
         "max_amount": max_bound,
+        "min_block": min_block_bound,
+        "max_block": max_block_bound,
     }
 
 
@@ -217,6 +259,11 @@ def _matches(record, filters):
     if filters["min_amount"] is not None and amount < int(filters["min_amount"]):
         return False
     if filters["max_amount"] is not None and amount > int(filters["max_amount"]):
+        return False
+    block_number = record["block_number"]
+    if filters["min_block"] is not None and block_number < filters["min_block"]:
+        return False
+    if filters["max_block"] is not None and block_number > filters["max_block"]:
         return False
     return True
 

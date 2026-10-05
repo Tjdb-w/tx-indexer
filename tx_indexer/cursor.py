@@ -16,6 +16,11 @@
 边界后复用旧游标报 InvalidCursorError；未携带金额字段的旧游标只在
 未指定金额边界时继续有效。
 
+区块高度边界（min_block / max_block）统一存为非负整数并按数值绑定：
+增加、删除或改变任一边界后复用旧游标报 InvalidCursorError；未携带
+区块边界字段的旧游标只在本次未指定任一边界时继续有效，指定任一边界
+即报 InvalidCursorError。
+
 时间分桶聚合游标（scope ``time-bucket-aggregation``）只绑定该入口的
 完整查询条件（address、method、起止时间）与桶粒度（hour/day），
 解码失败或条件不一致抛 InvalidAggregationCursor，与其余分页游标
@@ -69,9 +74,20 @@ def _as_canonical_amount(value):
     return str(int(value))
 
 
+def _as_canonical_block(value):
+    """区块高度端点的规范形：None → None，否则必须为非负整数
+    （bool 不是整数）。旧游标缺少该字段时 .get 得到 None，只在本次
+    也未指定边界时等价。"""
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError("区块高度边界必须为非负整数")
+    return value
+
+
 def _canonical_filters(filters):
     """提取用于游标绑定比对的筛选快照（集合归一化为排序列表、金额归一化
-    为无前导零字符串）。"""
+    为无前导零字符串、区块高度保持非负整数）。"""
     return {
         "address": filters.get("address"),
         "from_address": _as_sorted_list(filters.get("from_address")),
@@ -81,6 +97,8 @@ def _canonical_filters(filters):
         "end_time": filters.get("end_time"),
         "min_amount": _as_canonical_amount(filters.get("min_amount")),
         "max_amount": _as_canonical_amount(filters.get("max_amount")),
+        "min_block": _as_canonical_block(filters.get("min_block")),
+        "max_block": _as_canonical_block(filters.get("max_block")),
     }
 
 

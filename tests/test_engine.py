@@ -6,6 +6,8 @@ from tx_indexer.engine import TxIndexer, normalize_filters
 from tx_indexer.errors import (
     InvalidAmountFilterError,
     InvalidAmountRangeError,
+    InvalidBlockFilterError,
+    InvalidBlockRangeError,
     InvalidBucketSizeError,
     InvalidCursorError,
     InvalidFilterError,
@@ -1942,6 +1944,291 @@ class AmountFilterTest(unittest.TestCase):
         self.assertEqual(hashes(result), ["y"])
         stats = idx.stats(normalize_filters(min_amount=big, max_amount=big))
         self.assertEqual(stats["total_amount"], big)
+
+
+class BlockFilterTest(unittest.TestCase):
+    def setUp(self):
+        self.records = [
+            rec("h0", 0, 0, "alice", "bob", "transfer", "0"),
+            rec("h1", 1, 10, "alice", "bob", "transfer", "10"),
+            rec("h2", 2, 20, "bob", "alice", "approve", "20"),
+            rec("h3", 2, 30, "alice", "carol", "transfer", "30"),
+            rec("h4", 3, 40, "bob", "dave", "transfer", "100"),
+        ]
+        self.idx = TxIndexer(self.records)
+
+    def test_query_closed_interval_inclusive_both_ends(self):
+        result = self.idx.query(
+            normalize_filters(min_block=1, max_block=2)
+        )
+        self.assertEqual(hashes(result), ["h1", "h2", "h3"])
+        self.assertEqual(result["total"], 3)
+        self.assertIsNone(result["next_cursor"])
+
+    def test_query_single_bound_unbounded_other_side(self):
+        self.assertEqual(
+            hashes(self.idx.query(normalize_filters(min_block=2))),
+            ["h2", "h3", "h4"],
+        )
+        self.assertEqual(
+            hashes(self.idx.query(normalize_filters(max_block=1))),
+            ["h0", "h1"],
+        )
+
+    def test_query_zero_is_valid_bound(self):
+        result = self.idx.query(
+            normalize_filters(min_block=0, max_block=0)
+        )
+        self.assertEqual(hashes(result), ["h0"])
+
+    def test_equal_bounds_single_block(self):
+        filters = normalize_filters(min_block=2, max_block=2)
+        self.assertEqual(filters["min_block"], 2)
+        self.assertEqual(filters["max_block"], 2)
+        self.assertEqual(
+            hashes(self.idx.query(filters)), ["h2", "h3"]
+        )
+
+    def test_query_intersects_with_other_filters(self):
+        result = self.idx.query(
+            normalize_filters(
+                address="alice", method="transfer",
+                start_time=0, end_time=100,
+                min_amount="10", max_amount="30",
+                min_block=1, max_block=2,
+            )
+        )
+        self.assertEqual(hashes(result), ["h1", "h3"])
+        # 与金额区间求交集：alice 的 transfer 中金额只有 h1/h3 落在
+        # 10..30，但区块下界 2 排除 h1
+        result2 = self.idx.query(
+            normalize_filters(
+                address="alice", method="transfer",
+                min_amount="10", max_amount="30",
+                min_block=2,
+            )
+        )
+        self.assertEqual(hashes(result2), ["h3"])
+
+    def test_query_empty_result_shape_unchanged(self):
+        result = self.idx.query(
+            normalize_filters(min_block=999), page_size=2
+        )
+        self.assertEqual(result["transactions"], [])
+        self.assertEqual(result["total"], 0)
+        self.assertIsNone(result["next_cursor"])
+
+    def test_stats_recomputed_on_matched_only(self):
+        stats = self.idx.stats(normalize_filters(min_block=2))
+        self.assertEqual(stats, {
+            "total_count": 3,
+            "total_amount": "150",
+            "min_amount": "20",
+            "max_amount": "100",
+            "avg_amount": "50",
+        })
+
+    def test_stats_empty_shape_unchanged(self):
+        stats = self.idx.stats(normalize_filters(max_block=0))
+        self.assertEqual(stats["total_count"], 1)
+        self.assertEqual(stats["total_amount"], "0")
+        none_match = self.idx.stats(normalize_filters(min_block=999))
+        self.assertEqual(none_match, {
+            "total_count": 0,
+            "total_amount": "0",
+            "min_amount": None,
+            "max_amount": None,
+            "avg_amount": None,
+        })
+
+    def test_grouped_stats_all_scope_block_filter(self):
+        f = normalize_filters(min_block=2)
+        method = self.idx.method_stats(f)
+        self.assertEqual(method["total_groups"], 2)
+        by_method = {g["method"]: g for g in method["groups"]}
+        self.assertEqual(by_method["transfer"]["total_count"], 2)
+        self.assertEqual(by_method["transfer"]["total_amount"], "130")
+        self.assertEqual(by_method["approve"]["total_amount"], "20")
+
+        addresses = self.idx.address_stats(f)
+        self.assertEqual(addresses["total_groups"], 4)
+        amounts = {g["address"]: g["total_amount"]
+                   for g in addresses["groups"]}
+        self.assertEqual(amounts,
+                         {"alice": "50", "bob": "120",
+                          "carol": "30", "dave": "100"})
+
+        counterparties = self.idx.counterparty_stats(
+            normalize_filters(address="alice", min_block=2)
+        )
+        self.assertEqual(counterparties["address"], "alice")
+        self.assertEqual(counterparties["total_groups"], 2)
+        cp_amounts = {g["counterparty"]: g["total_amount"]
+                      for g in counterparties["groups"]}
+        self.assertEqual(cp_amounts, {"carol": "30", "bob": "20"})
+
+        buckets = self.idx.time_stats(f, bucket_size=100)
+        self.assertEqual(buckets["total_groups"], 1)
+        self.assertEqual(buckets["groups"][0]["total_amount"], "150")
+
+        pairs = self.idx.pair_stats(f)
+        self.assertEqual(pairs["total_groups"], 3)
+
+        ats = self.idx.address_time_stats(f, bucket_size=100)
+        self.assertEqual(ats["total_groups"], 4)
+
+    def test_grouped_stats_empty_shape_unchanged(self):
+        f = normalize_filters(min_block=999)
+        self.assertEqual(self.idx.method_stats(f)["groups"], [])
+        self.assertEqual(self.idx.method_stats(f)["total_groups"], 0)
+        self.assertIsNone(self.idx.method_stats(f)["next_cursor"])
+        self.assertEqual(self.idx.address_stats(f)["groups"], [])
+        cp = self.idx.counterparty_stats(
+            normalize_filters(address="alice", min_block=999))
+        self.assertEqual(cp["groups"], [])
+        self.assertEqual(cp["address"], "alice")
+        self.assertEqual(self.idx.time_stats(f, 60)["groups"], [])
+        self.assertEqual(self.idx.time_stats(f, 60)["total_groups"], 0)
+        self.assertEqual(self.idx.pair_stats(f)["groups"], [])
+        self.assertEqual(self.idx.address_time_stats(f, 60)["groups"], [])
+
+    def test_invalid_block_filter_non_int(self):
+        self.assertIsNone(normalize_filters(min_block=None)["min_block"])
+        for bad in ("10", "", " ", "-1", "+1", "1.0", 10.0, True, False,
+                    b"10", [1], {"v": 1}, object(), -1):
+            with self.assertRaises(InvalidBlockFilterError) as ctx_min:
+                normalize_filters(min_block=bad)
+            self.assertNotIsInstance(
+                ctx_min.exception, ValueError,
+                "区块边界非法不能回退为 ValueError：%r" % bad,
+            )
+            with self.assertRaises(InvalidBlockFilterError):
+                normalize_filters(max_block=bad)
+
+    def test_block_range_inverted(self):
+        with self.assertRaises(InvalidBlockRangeError) as ctx:
+            normalize_filters(min_block=11, max_block=10)
+        self.assertNotIsInstance(ctx.exception, ValueError)
+        self.assertEqual(ctx.exception.error, "invalid_block_range")
+
+    def test_pagination_bound_to_block(self):
+        filters = normalize_filters(min_block=2)
+        collected = []
+        cursor = None
+        while True:
+            page = self.idx.query(filters, page_size=1, cursor=cursor)
+            self.assertEqual(page["total"], 3)
+            collected.extend(hashes(page))
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(collected, ["h2", "h3", "h4"])
+
+    def test_cursor_rejects_changed_block_bounds(self):
+        page = self.idx.query(
+            normalize_filters(min_block=2), page_size=1
+        )
+        cursor = page["next_cursor"]
+        self.assertIsNotNone(cursor)
+        # 改下界
+        with self.assertRaises(InvalidCursorError):
+            self.idx.query(
+                normalize_filters(min_block=1), page_size=1,
+                cursor=cursor,
+            )
+        # 增上界
+        with self.assertRaises(InvalidCursorError):
+            self.idx.query(
+                normalize_filters(min_block=2, max_block=100),
+                page_size=1, cursor=cursor,
+            )
+        # 删除边界
+        with self.assertRaises(InvalidCursorError):
+            self.idx.query(
+                normalize_filters(), page_size=1, cursor=cursor
+            )
+        # 无区块边界游标不能在有区块筛选下续用
+        no_block = self.idx.query(normalize_filters(), page_size=1)
+        with self.assertRaises(InvalidCursorError):
+            self.idx.query(
+                normalize_filters(max_block=30), page_size=1,
+                cursor=no_block["next_cursor"],
+            )
+
+    def test_cursor_same_bounds_different_request_continues(self):
+        page1 = self.idx.query(
+            normalize_filters(min_block=2), page_size=1
+        )
+        cursor = page1["next_cursor"]
+        # 相同边界（数值相同即可，与金额不同，整数无前导零概念）续页
+        page2 = self.idx.query(
+            normalize_filters(min_block=2), page_size=1, cursor=cursor
+        )
+        self.assertEqual(hashes(page2), ["h3"])
+
+    def test_grouped_stats_cursor_bound_to_block(self):
+        page = self.idx.method_stats(
+            normalize_filters(min_block=2), page_size=1
+        )
+        cursor = page["next_cursor"]
+        with self.assertRaises(InvalidCursorError):
+            self.idx.method_stats(
+                normalize_filters(min_block=1), page_size=1,
+                cursor=cursor,
+            )
+        again = self.idx.method_stats(
+            normalize_filters(min_block=2), page_size=1, cursor=cursor
+        )
+        # min_block=2 下 transfer 总额 130 排首位，次页为 approve
+        self.assertEqual([g["method"] for g in again["groups"]], ["approve"])
+
+    def test_time_stats_cursor_bound_to_block(self):
+        page = self.idx.time_stats(
+            normalize_filters(max_block=2), bucket_size=15, page_size=1
+        )
+        self.assertIsNotNone(page["next_cursor"])
+        cursor = page["next_cursor"]
+        with self.assertRaises(InvalidCursorError):
+            self.idx.time_stats(
+                normalize_filters(), bucket_size=15, page_size=1,
+                cursor=cursor,
+            )
+
+    def test_legacy_cursor_without_block_fields(self):
+        """旧游标（筛选快照缺少 min_block/max_block）只在未指定区块
+        边界时可续翻；指定任一边界即报 invalid_cursor。"""
+        from tx_indexer.cursor import SCOPE_QUERY, _encode_payload
+
+        legacy_filters = {
+            "address": None,
+            "from_address": None,
+            "to_address": None,
+            "method": None,
+            "start_time": None,
+            "end_time": None,
+            "min_amount": None,
+            "max_amount": None,
+        }
+        token = _encode_payload({
+            "v": 1,
+            "c": SCOPE_QUERY,
+            "f": legacy_filters,
+            "after": [1, "h1"],
+        })
+        # 未指定区块边界：旧游标可续页（从 h1 之后开始）
+        page = self.idx.query(
+            normalize_filters(), page_size=10, cursor=token
+        )
+        self.assertEqual(hashes(page), ["h2", "h3", "h4"])
+        # 指定任一边界：旧游标失效
+        with self.assertRaises(InvalidCursorError):
+            self.idx.query(
+                normalize_filters(min_block=0), page_size=10, cursor=token
+            )
+        with self.assertRaises(InvalidCursorError):
+            self.idx.query(
+                normalize_filters(max_block=3), page_size=10, cursor=token
+            )
 
 
 if __name__ == "__main__":

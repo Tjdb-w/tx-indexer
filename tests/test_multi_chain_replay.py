@@ -394,6 +394,46 @@ class QueryTest(unittest.TestCase):
                 "chain-a", normalize_filters(start_time=30, end_time=10)
             )
 
+    def test_block_filter(self):
+        result = self.manager.query(
+            "chain-a", normalize_filters(min_block=1)
+        )
+        self.assertEqual(hashes(result), ["a3"])
+        self.assertEqual(result["total"], 1)
+        result = self.manager.query(
+            "chain-a", normalize_filters(max_block=0)
+        )
+        self.assertEqual(hashes(result), ["a1", "a2"])
+        result = self.manager.query(
+            "chain-a", normalize_filters(min_block=0, max_block=1)
+        )
+        self.assertEqual(hashes(result), ["a1", "a2", "a3"])
+        # stats 同样按区块交集计算
+        stats = self.manager.stats(
+            "chain-a", normalize_filters(min_block=1)
+        )
+        self.assertEqual(stats["total_count"], 1)
+        self.assertEqual(stats["total_amount"], "100")
+
+    def test_block_cursor_bound_to_bounds(self):
+        page = self.manager.query(
+            "chain-a", normalize_filters(min_block=0), page_size=1
+        )
+        cursor = page["next_cursor"]
+        self.assertIsNotNone(cursor)
+        # 相同边界可续页
+        again = self.manager.query(
+            "chain-a", normalize_filters(min_block=0), page_size=1,
+            cursor=cursor,
+        )
+        self.assertEqual(hashes(again), ["a2"])
+        # 改变/删除边界 → invalid_cursor
+        for f in (normalize_filters(min_block=1), normalize_filters()):
+            with self.assertRaises(InvalidCursorError):
+                self.manager.query(
+                    "chain-a", f, page_size=1, cursor=cursor
+                )
+
     def test_invalid_page_size_raises(self):
         for bad in (0, -1, 1001, 1.5, True, "10"):
             with self.assertRaises(InvalidPageSizeError):

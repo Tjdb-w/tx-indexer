@@ -1508,5 +1508,225 @@ class AmountFilterCliTest(unittest.TestCase):
         self.assertEqual([t["tx_hash"] for t in page2["transactions"]], ["h2"])
 
 
+class BlockFilterCliTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "data.jsonl")
+        with open(self.path, "w", encoding="utf-8") as fh:
+            for obj in DATA_LINES:
+                fh.write(json.dumps(obj) + "\n")
+        self._stdout, self._stderr = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+
+    def tearDown(self):
+        sys.stdout, sys.stderr = self._stdout, self._stderr
+        self.tmp.cleanup()
+
+    def _run(self, argv):
+        sys.stdout.seek(0)
+        sys.stdout.truncate(0)
+        sys.stderr.seek(0)
+        sys.stderr.truncate(0)
+        code = main(argv)
+        out = sys.stdout.getvalue()
+        err = sys.stderr.getvalue()
+        return code, json.loads(out) if out.strip() else None, err
+
+    def test_query_block_closed_interval(self):
+        code, page, err = self._run(
+            ["query", self.path, "--min-block", "1",
+             "--max-block", "2"])
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual([t["tx_hash"] for t in page["transactions"]],
+                         ["h1", "h2", "h3"])
+        self.assertEqual(page["total"], 3)
+
+    def test_single_bound_and_zero(self):
+        code, page, _ = self._run(
+            ["query", self.path, "--min-block", "2"])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page["transactions"]],
+                         ["h2", "h3"])
+
+        code, page, _ = self._run(
+            ["query", self.path, "--max-block", "1"])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page["transactions"]], ["h1"])
+
+        code, page, _ = self._run(
+            ["query", self.path, "--min-block", "0",
+             "--max-block", "0"])
+        self.assertEqual(code, 0)
+        self.assertEqual(page["transactions"], [])
+        self.assertEqual(page["total"], 0)
+
+    def test_leading_zeros_are_decimal_digits(self):
+        # 纯数字文本（含前导零）按十进制解析，命中相同
+        code, page, _ = self._run(
+            ["query", self.path, "--min-block", "0001",
+             "--max-block", "02"])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page["transactions"]],
+                         ["h1", "h2", "h3"])
+
+    def test_block_intersects_other_filters(self):
+        code, page, _ = self._run([
+            "query", self.path,
+            "--address", "alice", "--method", "transfer",
+            "--min-block", "2", "--max-block", "2",
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page["transactions"]], ["h3"])
+
+    def test_stats_and_groups_recomputed(self):
+        code, stats, _ = self._run(
+            ["stats", self.path, "--min-block", "2"])
+        self.assertEqual(code, 0)
+        self.assertEqual(stats, {
+            "total_count": 2,
+            "total_amount": "26",
+            "min_amount": "5",
+            "max_amount": "21",
+            "avg_amount": "13",
+        })
+
+        for command, extra in (
+            ("method-stats", []),
+            ("address-stats", []),
+            ("counterparty-stats", ["--address", "alice"]),
+            ("time-stats", ["--bucket-size", "60"]),
+            ("pair-stats", []),
+            ("address-time-stats", ["--bucket-size", "60"]),
+        ):
+            code, result, _ = self._run(
+                [command, self.path, "--min-block", "100"] + extra)
+            self.assertEqual(code, 0)
+            self.assertEqual(result["groups"], [])
+            self.assertEqual(result["total_groups"], 0)
+            self.assertIsNone(result["next_cursor"])
+
+    def test_invalid_block_filter_exit_2_single_line_json(self):
+        missing = os.path.join(self.tmp.name, "missing.jsonl")
+        bad_values = ("", " ", "-1", "+1", "1.0", ".5", "abc",
+                      "1e3", "0x1", " 10", "10 ", "１０", "true",
+                      "1_0")
+        for flag in ("--min-block", "--max-block"):
+            for bad in bad_values:
+                code, out, err = self._run(
+                    ["query", missing, flag, bad])
+                self.assertEqual(code, 2, (flag, bad))
+                self.assertIsNone(out)
+                self.assertEqual(err.strip().count("\n"), 0, (flag, bad))
+                payload = json.loads(err)
+                self.assertEqual(payload["error"], "invalid_block_filter")
+                self.assertIsNone(payload["input_line"])
+
+    def test_invalid_block_range_exit_2(self):
+        missing = os.path.join(self.tmp.name, "missing.jsonl")
+        code, out, err = self._run([
+            "query", missing,
+            "--min-block", "11", "--max-block", "10"])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        self.assertEqual(err.strip().count("\n"), 0)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_block_range")
+        self.assertIsNone(payload["input_line"])
+
+        # 相等为合法闭区间：正常查询而非区间报错
+        code, page, err = self._run([
+            "query", self.path,
+            "--min-block", "2", "--max-block", "2"])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page["transactions"]],
+                         ["h2", "h3"])
+
+    def test_block_errors_before_data_load(self):
+        # 数据文件不存在，但参数错误应先报 invalid_block_filter
+        missing = os.path.join(self.tmp.name, "missing.jsonl")
+        code, out, err = self._run(
+            ["query", missing, "--min-block", "x"])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        self.assertEqual(json.loads(err)["error"], "invalid_block_filter")
+
+        code, out, err = self._run([
+            "query", missing, "--min-block", "9", "--max-block", "1"])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(err)["error"], "invalid_block_range")
+
+    def test_cursor_bound_to_block_bounds(self):
+        code, page1, _ = self._run([
+            "query", self.path, "--min-block", "1", "--page-size", "1"])
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(page1["next_cursor"])
+
+        # 相同边界续页正常
+        code, page2, _ = self._run([
+            "query", self.path, "--min-block", "1", "--page-size", "1",
+            "--cursor", page1["next_cursor"]])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page2["transactions"]], ["h2"])
+
+        # 改变/增加/删除任一边界 → invalid_cursor
+        for extra in (
+            ["--min-block", "2"],
+            ["--min-block", "1", "--max-block", "2"],
+            [],
+        ):
+            code, out, err = self._run(
+                ["query", self.path, "--page-size", "1",
+                 "--cursor", page1["next_cursor"]] + extra)
+            self.assertEqual(code, 2)
+            self.assertIsNone(out)
+            self.assertEqual(json.loads(err)["error"], "invalid_cursor")
+
+    def test_old_cursor_without_block_bounds(self):
+        # 不带区块边界签发的游标：未指定边界可续翻，指定任一边界失效
+        code, page1, _ = self._run(
+            ["query", self.path, "--page-size", "1"])
+        self.assertEqual(code, 0)
+        code, page2, _ = self._run([
+            "query", self.path, "--page-size", "1",
+            "--cursor", page1["next_cursor"]])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page2["transactions"]], ["h2"])
+        for flag in ("--min-block", "--max-block"):
+            code, out, err = self._run([
+                "query", self.path, "--page-size", "1",
+                "--cursor", page1["next_cursor"], flag, "1"])
+            self.assertEqual(code, 2)
+            self.assertEqual(json.loads(err)["error"], "invalid_cursor")
+
+    def test_block_accepted_by_all_paginated_commands(self):
+        for command, extra in (
+            ("query", []),
+            ("method-stats", []),
+            ("address-stats", []),
+            ("counterparty-stats", ["--address", "alice"]),
+            ("time-stats", ["--bucket-size", "60"]),
+            ("pair-stats", []),
+            ("address-time-stats", ["--bucket-size", "60"]),
+        ):
+            code, result, err = self._run(
+                [command, self.path, "--min-block", "1",
+                 "--max-block", "2"] + extra)
+            self.assertEqual(code, 0, (command, err))
+
+    def test_block_accepted_by_stats(self):
+        code, stats, _ = self._run(
+            ["stats", self.path, "--min-block", "2", "--max-block", "2"])
+        self.assertEqual(code, 0)
+        self.assertEqual(stats["total_count"], 2)
+
+    def test_time_bucket_aggregation_has_no_block_filter(self):
+        # time-bucket-aggregation 不接受区块边界参数
+        with self.assertRaises(SystemExit):
+            main(["time-bucket-aggregation", self.path,
+                  "--start-time", "0", "--end-time", "60",
+                  "--bucket", "hour", "--min-block", "1"])
+
+
 if __name__ == "__main__":
     unittest.main()
