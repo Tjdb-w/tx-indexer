@@ -79,6 +79,30 @@ class InvalidBucketSizeError(TxIndexerError):
     error = "invalid_bucket_size"
 
 
+class InvalidAggregationRange(TxIndexerError):
+    """时间分桶聚合的时间范围非法（结束时间早于或等于开始时间等）。"""
+
+    error = "invalid_aggregation_range"
+
+
+class UnsupportedAggregationBucket(TxIndexerError):
+    """时间分桶聚合的桶粒度不受支持（只接受 hour 或 day）。"""
+
+    error = "unsupported_aggregation_bucket"
+
+
+class InvalidAggregationFilter(TxIndexerError):
+    """时间分桶聚合的地址或方法筛选值无法按公开语义解释。"""
+
+    error = "invalid_aggregation_filter"
+
+
+class InvalidAggregationCursor(TxIndexerError):
+    """时间分桶聚合游标非法（格式错误、被篡改）或与当前查询条件不一致。"""
+
+    error = "invalid_aggregation_cursor"
+
+
 class SourceUnavailableError(TxIndexerError):
     """上游暂时无法返回指定区块；已提交批次与水位保持有效。"""
 

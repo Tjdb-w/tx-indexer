@@ -1,6 +1,6 @@
 """命令行入口：``tx-indexer query`` / ``stats`` / ``method-stats`` /
 ``address-stats`` / ``counterparty-stats`` / ``time-stats`` /
-``pair-stats`` / ``address-time-stats``。
+``pair-stats`` / ``address-time-stats`` / ``time-bucket-stats``。
 
 用法：
     tx-indexer query <data.jsonl> [筛选与分页选项]
@@ -11,10 +11,13 @@
     tx-indexer time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
     tx-indexer pair-stats <data.jsonl> [筛选与分页选项]
     tx-indexer address-time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
+    tx-indexer time-bucket-stats <data.jsonl> --start-time TS --end-time TS [--bucket hour|day] [选项]
 
 领域错误（invalid_transaction / duplicate_transaction / invalid_time_range /
 invalid_page_size / invalid_cursor / invalid_filter / invalid_bucket_size /
-invalid_amount_filter / invalid_amount_range）
+invalid_amount_filter / invalid_amount_range / invalid_aggregation_range /
+unsupported_aggregation_bucket / invalid_aggregation_filter /
+invalid_aggregation_cursor）
 以 JSON 对象输出到 stderr，退出码 2：
 
     {"error": "...", "message": "...", "input_line": 12}
@@ -26,6 +29,7 @@ import sys
 
 from .engine import DEFAULT_PAGE_SIZE, TxIndexer, normalize_filters
 from .errors import (
+    InvalidAggregationRange,
     InvalidBucketSizeError,
     InvalidFilterError,
     InvalidPageSizeError,
@@ -102,6 +106,26 @@ def _parse_bucket_size(value):
     if parsed < 1:
         raise InvalidBucketSizeError(
             "bucket_size 必须为大于 0 的整数（秒）", None
+        )
+    return parsed
+
+
+def _parse_aggregation_time(value, flag):
+    """解析 time-bucket-stats 的时间边界；缺失、非整数或为负都报
+    invalid_aggregation_range（读取数据文件前）。"""
+    if value is None:
+        raise InvalidAggregationRange(
+            "必须指定 %s（UTC 秒）" % flag, None
+        )
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise InvalidAggregationRange(
+            "%s 必须为非负 UTC 秒整数" % flag, None
+        )
+    if parsed < 0:
+        raise InvalidAggregationRange(
+            "%s 必须为非负 UTC 秒整数" % flag, None
         )
     return parsed
 
@@ -232,6 +256,42 @@ def build_parser():
         "--cursor", help="上一页返回的 next_cursor"
     )
 
+    time_bucket_stats_parser = subparsers.add_parser(
+        "time-bucket-stats",
+        help="按小时或自然日分桶分页聚合"
+             "（返回 buckets/total_buckets/next_cursor）",
+    )
+    time_bucket_stats_parser.add_argument(
+        "file", help="JSON Lines 数据文件路径"
+    )
+    time_bucket_stats_parser.add_argument(
+        "--address",
+        help="精确匹配发送方或接收方地址",
+    )
+    time_bucket_stats_parser.add_argument(
+        "--method",
+        help="精确匹配 method",
+    )
+    time_bucket_stats_parser.add_argument(
+        "--start-time", help="时间范围起点（UTC 秒，含），必填"
+    )
+    time_bucket_stats_parser.add_argument(
+        "--end-time", help="时间范围终点（UTC 秒，不含），必填"
+    )
+    time_bucket_stats_parser.add_argument(
+        "--bucket",
+        default="hour",
+        help="桶粒度：hour（UTC 整点）或 day（UTC 自然日），默认 hour",
+    )
+    time_bucket_stats_parser.add_argument(
+        "--page-size",
+        default=str(DEFAULT_PAGE_SIZE),
+        help="每页桶数，1 到 1000，默认 100",
+    )
+    time_bucket_stats_parser.add_argument(
+        "--cursor", help="上一页返回的 next_cursor"
+    )
+
     return parser
 
 
@@ -267,6 +327,28 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     try:
+        if args.command == "time-bucket-stats":
+            # 时间分桶聚合：筛选语义独立（时间窗左闭右开、单一地址/方法），
+            # 不走 normalize_filters；时间边界缺失或非法在读取数据文件前
+            # 报 invalid_aggregation_range
+            agg_start = _parse_aggregation_time(args.start_time, "--start-time")
+            agg_end = _parse_aggregation_time(args.end_time, "--end-time")
+            page_size = _parse_page_size(args.page_size)
+            records = load_file(args.file)
+            indexer = TxIndexer(records)
+            result = indexer.time_bucket_stats(
+                agg_start,
+                agg_end,
+                address=args.address,
+                method=args.method,
+                bucket=args.bucket,
+                page_size=page_size,
+                cursor=args.cursor,
+            )
+            json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+            return 0
+
         filters = _filters_from_args(args, parser)
         page_size = None
         if args.command in (

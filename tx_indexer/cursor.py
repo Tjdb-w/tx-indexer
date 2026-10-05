@@ -21,7 +21,7 @@ import base64
 import binascii
 import json
 
-from .errors import InvalidCursorError
+from .errors import InvalidAggregationCursor, InvalidCursorError
 from .loader import _AMOUNT_RE
 
 _CURSOR_VERSION = 1
@@ -38,6 +38,8 @@ SCOPE_PAIR_STATS = "pair-stats"
 SCOPE_ADDRESS_TIME_STATS = "address-time-stats"
 #: 增量导入游标的作用域标识（与所有分页游标相互独立，不能混用）
 SCOPE_IMPORT = "import"
+#: 时间分桶聚合游标的作用域标识（绑定完整查询条件与桶粒度）
+SCOPE_TIME_BUCKET_STATS = "time-bucket-stats"
 
 
 def _as_sorted_list(value):
@@ -518,3 +520,72 @@ def decode_address_time_stats_cursor(token, filters, bucket_size):
         raise InvalidCursorError("游标位置信息非法", None)
 
     return after[0], after[1], after[2], after[3], after[4], after[5]
+
+
+def _canonical_aggregation_filters(filters):
+    """时间分桶聚合的查询条件快照：可选地址、可选方法与左闭右开时间窗。"""
+    return {
+        "address": filters.get("address"),
+        "method": filters.get("method"),
+        "start_time": filters.get("start_time"),
+        "end_time": filters.get("end_time"),
+    }
+
+
+def encode_time_bucket_stats_cursor(filters, bucket, after_bucket_start):
+    """时间分桶聚合游标：绑定完整查询条件（地址、方法、时间窗）与桶粒度，
+    不绑定 page_size。"""
+    payload = {
+        "v": _CURSOR_VERSION,
+        "c": SCOPE_TIME_BUCKET_STATS,
+        "f": _canonical_aggregation_filters(filters),
+        "b": bucket,
+        "after": after_bucket_start,
+    }
+    return _encode_payload(payload)
+
+
+def decode_time_bucket_stats_cursor(token, filters, bucket):
+    """解码并校验时间分桶聚合游标，返回 exclusive marker ``bucket_start``。
+
+    格式错误、被篡改、跨命令复用、查询条件或桶粒度与当前请求不一致，
+    都抛 InvalidAggregationCursor。
+    """
+    if not isinstance(token, str) or token == "":
+        raise InvalidAggregationCursor("游标为空或类型非法", None)
+
+    try:
+        raw = _b64url_decode(token)
+    except InvalidCursorError as exc:
+        raise InvalidAggregationCursor("游标编码非法", None) from exc
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InvalidAggregationCursor("游标内容非法", None) from exc
+
+    if not isinstance(payload, dict) or payload.get("v") != _CURSOR_VERSION:
+        raise InvalidAggregationCursor("游标版本不受支持", None)
+
+    if payload.get("c") != SCOPE_TIME_BUCKET_STATS:
+        raise InvalidAggregationCursor("游标不属于当前命令", None)
+
+    saved = payload.get("f")
+    if not isinstance(saved, dict):
+        raise InvalidAggregationCursor("游标缺少查询条件", None)
+    if _canonical_aggregation_filters(saved) != (
+        _canonical_aggregation_filters(filters)
+    ):
+        raise InvalidAggregationCursor("游标与当前查询条件不匹配", None)
+
+    if payload.get("b") != bucket:
+        raise InvalidAggregationCursor("游标与当前桶粒度不匹配", None)
+
+    after = payload.get("after")
+    if (
+        not isinstance(after, int)
+        or isinstance(after, bool)
+        or after < 0
+    ):
+        raise InvalidAggregationCursor("游标位置信息非法", None)
+
+    return after

@@ -27,6 +27,11 @@ address-time-stats 先按从 Unix 纪元对齐、左闭右开的固定宽度时�
 返回非空（区间, 地址）组，顺序为 bucket_start 升序、total_amount
 降序、total_count 降序、send_count 降序、receive_count 降序、
 address 码点升序。
+time_bucket_stats 是独立的时间分桶聚合入口：接收可选地址、可选方法
+与左闭右开时间窗（UTC），按 hour（整点）或 day（自然日）输出连续
+桶（空桶计 0 不跳过），每桶含 bucket_start、total_count、
+success_count、failure_count，按 bucket_start 升序分页，游标绑定
+完整查询条件与桶粒度。
 分页：不透明 keyset 游标（见 :mod:`tx_indexer.cursor`），相同命令与
 筛选下不跳过、不重复、不乱序；``total`` / ``total_groups`` 始终为
 全部匹配数 / 全部分组数。
@@ -41,6 +46,7 @@ from .cursor import (
     decode_cursor,
     decode_method_stats_cursor,
     decode_pair_stats_cursor,
+    decode_time_bucket_stats_cursor,
     decode_time_stats_cursor,
     encode_address_stats_cursor,
     encode_address_time_stats_cursor,
@@ -48,20 +54,27 @@ from .cursor import (
     encode_cursor,
     encode_method_stats_cursor,
     encode_pair_stats_cursor,
+    encode_time_bucket_stats_cursor,
     encode_time_stats_cursor,
 )
 from .errors import (
+    InvalidAggregationFilter,
+    InvalidAggregationRange,
     InvalidAmountFilterError,
     InvalidAmountRangeError,
     InvalidBucketSizeError,
     InvalidFilterError,
     InvalidPageSizeError,
     InvalidTimeRangeError,
+    UnsupportedAggregationBucket,
 )
 from .loader import _AMOUNT_RE
 
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 1000
+
+#: 时间分桶聚合支持的桶粒度：hour 按 UTC 整点切分，day 按 UTC 自然日切分
+_AGGREGATION_BUCKET_SIZES = {"hour": 3600, "day": 86400}
 
 _PUBLIC_FIELDS = (
     "tx_hash",
@@ -957,5 +970,130 @@ class TxIndexer:
         return {
             "groups": groups,
             "total_groups": total_groups,
+            "next_cursor": next_cursor,
+        }
+
+    def time_bucket_stats(self, start_time, end_time, address=None,
+                          method=None, bucket="hour",
+                          page_size=DEFAULT_PAGE_SIZE, cursor=None):
+        """按小时或自然日分桶的分页聚合统计。
+
+        时间窗左闭右开（``start_time`` 含、``end_time`` 不含），全部按
+        UTC 计算：``bucket="hour"`` 按整点切分，``bucket="day"`` 按 UTC
+        自然日切分。输出从包含 ``start_time`` 的桶开始、按时间升序的
+        连续桶，最后一桶只覆盖 ``end_time`` 之前的数据；筛选范围内没有
+        交易的桶也返回，三项计数均为 0，不静默跳过。
+
+        每桶含 bucket_start（UTC 秒整数）、total_count、success_count、
+        failure_count；记录无 ``success`` 字段时按成功计。``address``
+        精确匹配发送方或接收方，``method`` 精确匹配方法，均可省略。
+
+        返回 {buckets, total_buckets, next_cursor}；``total_buckets`` 为
+        时间窗内全部桶数（不是当前页桶数），末页 ``next_cursor`` 为
+        None。游标绑定完整查询条件（地址、方法、时间窗）与桶粒度，不
+        绑定 page_size；格式错误、被篡改或与当前查询条件不一致都抛
+        InvalidAggregationCursor。
+
+        结束时间早于或等于开始时间抛 InvalidAggregationRange；桶粒度
+        不是 ``"hour"`` 或 ``"day"`` 抛 UnsupportedAggregationBucket；
+        地址或方法筛选值为空白抛 InvalidAggregationFilter。
+        """
+        if address is not None and (
+            not isinstance(address, str) or address.strip() == ""
+        ):
+            raise InvalidAggregationFilter(
+                "address 筛选值不能为空或仅含空白", None
+            )
+        if method is not None and (
+            not isinstance(method, str) or method.strip() == ""
+        ):
+            raise InvalidAggregationFilter(
+                "method 筛选值不能为空或仅含空白", None
+            )
+        for name, value in (("start_time", start_time), ("end_time", end_time)):
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                raise InvalidAggregationRange(
+                    "%s 必须为非负 UTC 秒整数" % name, None
+                )
+        if end_time <= start_time:
+            raise InvalidAggregationRange(
+                "时间范围非法：end_time(%d) 必须大于 start_time(%d)"
+                % (end_time, start_time),
+                None,
+            )
+        if bucket not in _AGGREGATION_BUCKET_SIZES:
+            raise UnsupportedAggregationBucket(
+                "桶粒度必须为 hour 或 day", None
+            )
+        self._validate_page_size(page_size)
+
+        bucket_size = _AGGREGATION_BUCKET_SIZES[bucket]
+        first_bucket_start = (start_time // bucket_size) * bucket_size
+        # 连续桶：从包含 start_time 的桶到最后一个起点小于 end_time 的桶
+        bucket_starts = list(range(first_bucket_start, end_time, bucket_size))
+        total_buckets = len(bucket_starts)
+
+        totals = {}
+        successes = {}
+        failures = {}
+        for record in self._records:
+            ts = record["timestamp"]
+            if ts < start_time or ts >= end_time:
+                continue
+            if address is not None and (
+                record["from_address"] != address
+                and record["to_address"] != address
+            ):
+                continue
+            if method is not None and record["method"] != method:
+                continue
+            bucket_start = (ts // bucket_size) * bucket_size
+            totals[bucket_start] = totals.get(bucket_start, 0) + 1
+            if record.get("success", True):
+                successes[bucket_start] = successes.get(bucket_start, 0) + 1
+            else:
+                failures[bucket_start] = failures.get(bucket_start, 0) + 1
+
+        filters = {
+            "address": address,
+            "method": method,
+            "start_time": start_time,
+            "end_time": end_time,
+        }
+
+        start = 0
+        if cursor is not None:
+            after_bucket_start = decode_time_bucket_stats_cursor(
+                cursor, filters, bucket
+            )
+            # keyset 续页：bucket_start 严格大于 marker 的第一个桶。
+            # marker 超出范围时得到空页，不会跳过或重复。
+            start = bisect.bisect_right(bucket_starts, after_bucket_start)
+
+        end = start + page_size
+        page_starts = bucket_starts[start:end]
+        buckets = [
+            {
+                "bucket_start": bucket_start,
+                "total_count": totals.get(bucket_start, 0),
+                "success_count": successes.get(bucket_start, 0),
+                "failure_count": failures.get(bucket_start, 0),
+            }
+            for bucket_start in page_starts
+        ]
+        if end < total_buckets:
+            next_cursor = encode_time_bucket_stats_cursor(
+                filters, bucket, page_starts[-1]
+            )
+        else:
+            next_cursor = None
+
+        return {
+            "buckets": buckets,
+            "total_buckets": total_buckets,
             "next_cursor": next_cursor,
         }

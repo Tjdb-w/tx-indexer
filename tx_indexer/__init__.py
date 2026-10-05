@@ -11,6 +11,9 @@
 
 from .errors import (
     DuplicateTransactionError,
+    InvalidAggregationCursor,
+    InvalidAggregationFilter,
+    InvalidAggregationRange,
     InvalidAmountFilterError,
     InvalidAmountRangeError,
     InvalidCursorError,
@@ -20,6 +23,7 @@ from .errors import (
     InvalidTransactionError,
     SourceUnavailableError,
     TransactionConflictError,
+    UnsupportedAggregationBucket,
 )
 from .importer import (
     BLOCK_CONFLICT,
@@ -38,6 +42,9 @@ __all__ = [
     "INVALID_IMPORT_BATCH",
     "INVALID_REPLACEMENT_BATCH",
     "IncrementalImporter",
+    "InvalidAggregationCursor",
+    "InvalidAggregationFilter",
+    "InvalidAggregationRange",
     "InvalidAmountFilterError",
     "InvalidAmountRangeError",
     "InvalidCursorError",
@@ -50,4 +57,5 @@ __all__ = [
     "SourceUnavailableError",
     "TX_CONFLICT",
     "TransactionConflictError",
+    "UnsupportedAggregationBucket",
 ]
