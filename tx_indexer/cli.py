@@ -1,6 +1,6 @@
 """命令行入口：``tx-indexer query`` / ``stats`` / ``method-stats`` /
 ``address-stats`` / ``counterparty-stats`` / ``time-stats`` /
-``pair-stats`` / ``address-time-stats``。
+``pair-stats`` / ``address-time-stats`` / ``time-bucket-aggregation``。
 
 用法：
     tx-indexer query <data.jsonl> [筛选与分页选项]
@@ -11,10 +11,13 @@
     tx-indexer time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
     tx-indexer pair-stats <data.jsonl> [筛选与分页选项]
     tx-indexer address-time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
+    tx-indexer time-bucket-aggregation <data.jsonl> --start-time TS --end-time TS --bucket hour|day [选项]
 
 领域错误（invalid_transaction / duplicate_transaction / invalid_time_range /
 invalid_page_size / invalid_cursor / invalid_filter / invalid_bucket_size /
-invalid_amount_filter / invalid_amount_range）
+invalid_amount_filter / invalid_amount_range / invalid_aggregation_range /
+unsupported_aggregation_bucket / invalid_aggregation_filter /
+invalid_aggregation_cursor）
 以 JSON 对象输出到 stderr，退出码 2：
 
     {"error": "...", "message": "...", "input_line": 12}
@@ -24,12 +27,20 @@ import argparse
 import json
 import sys
 
-from .engine import DEFAULT_PAGE_SIZE, TxIndexer, normalize_filters
+from .engine import (
+    DEFAULT_PAGE_SIZE,
+    TxIndexer,
+    normalize_filters,
+    validate_time_bucket_aggregation_params,
+)
 from .errors import (
+    InvalidAggregationFilter,
+    InvalidAggregationRange,
     InvalidBucketSizeError,
     InvalidFilterError,
     InvalidPageSizeError,
     TxIndexerError,
+    UnsupportedAggregationBucket,
 )
 from .loader import load_file
 
@@ -232,6 +243,44 @@ def build_parser():
         "--cursor", help="上一页返回的 next_cursor"
     )
 
+    time_bucket_parser = subparsers.add_parser(
+        "time-bucket-aggregation",
+        help="按小时/自然日连续分桶聚合"
+             "（返回 buckets/total_buckets/next_cursor，含空桶）",
+    )
+    time_bucket_parser.add_argument(
+        "file", help="JSON Lines 数据文件路径"
+    )
+    time_bucket_parser.add_argument(
+        "--address",
+        help="精确匹配发送方或接收方地址（可选）",
+    )
+    time_bucket_parser.add_argument(
+        "--method",
+        action="append",
+        help="精确匹配 method，可重复（集合内任一命中，可选）",
+    )
+    time_bucket_parser.add_argument(
+        "--start-time",
+        help="时间窗起点（UTC 秒，含）；必填，非负整数",
+    )
+    time_bucket_parser.add_argument(
+        "--end-time",
+        help="时间窗终点（UTC 秒，不含）；必填，非负整数且晚于起点",
+    )
+    time_bucket_parser.add_argument(
+        "--bucket",
+        help="桶粒度：hour（整点小时）或 day（UTC 自然日）；必填",
+    )
+    time_bucket_parser.add_argument(
+        "--page-size",
+        default=str(DEFAULT_PAGE_SIZE),
+        help="每页桶数，1 到 1000，默认 100",
+    )
+    time_bucket_parser.add_argument(
+        "--cursor", help="上一页返回的 next_cursor"
+    )
+
     return parser
 
 
@@ -267,62 +316,108 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     try:
-        filters = _filters_from_args(args, parser)
-        page_size = None
-        if args.command in (
-            "query",
-            "method-stats",
-            "address-stats",
-            "counterparty-stats",
-            "time-stats",
-            "pair-stats",
-            "address-time-stats",
-        ):
+        if args.command == "time-bucket-aggregation":
+            # 独立的时间分桶聚合入口：左闭右开、连续桶、含空桶，不与
+            # 既有命令共用筛选解析（既有时间窗为左闭右闭）。范围、桶粒度
+            # 与筛选值的校验全部在读取数据文件前完成。
+            if args.start_time is None or args.end_time is None:
+                raise InvalidAggregationRange(
+                    "time-bucket-aggregation 必须指定 --start-time 与"
+                    " --end-time（UTC 秒，左闭右开）",
+                    None,
+                )
+            try:
+                agg_start = int(args.start_time)
+                agg_end = int(args.end_time)
+            except (TypeError, ValueError):
+                raise InvalidAggregationRange(
+                    "--start-time 与 --end-time 必须为非负 UTC 秒整数",
+                    None,
+                )
+            if args.bucket is None:
+                raise UnsupportedAggregationBucket(
+                    "time-bucket-aggregation 必须指定 --bucket hour|day",
+                    None,
+                )
+            agg_method = tuple(args.method) if args.method else None
+            # 范围倒置、非法桶粒度、空白筛选均在此抛出对应聚合错误
+            _, _ = validate_time_bucket_aggregation_params(
+                agg_start,
+                agg_end,
+                args.bucket,
+                address=args.address,
+                method=agg_method,
+            )
             page_size = _parse_page_size(args.page_size)
-        bucket_size = None
-        if args.command in ("time-stats", "address-time-stats"):
-            # 缺失、非整数或不大于 0 都在读取数据文件前报 invalid_bucket_size
-            bucket_size = _parse_bucket_size(args.bucket_size)
-        if args.command == "counterparty-stats" and filters["address"] is None:
-            # 缺少 --address 与空白值、address/from/to 冲突一样，
-            # 都在读取数据文件前报 invalid_filter
-            raise InvalidFilterError(
-                "counterparty-stats 必须指定 --address", None
-            )
 
-        records = load_file(args.file)
-        indexer = TxIndexer(records)
-
-        if args.command == "query":
-            result = indexer.query(
-                filters, page_size=page_size, cursor=args.cursor
-            )
-        elif args.command == "method-stats":
-            result = indexer.method_stats(
-                filters, page_size=page_size, cursor=args.cursor
-            )
-        elif args.command == "address-stats":
-            result = indexer.address_stats(
-                filters, page_size=page_size, cursor=args.cursor
-            )
-        elif args.command == "counterparty-stats":
-            result = indexer.counterparty_stats(
-                filters, page_size=page_size, cursor=args.cursor
-            )
-        elif args.command == "time-stats":
-            result = indexer.time_stats(
-                filters, bucket_size, page_size=page_size, cursor=args.cursor
-            )
-        elif args.command == "pair-stats":
-            result = indexer.pair_stats(
-                filters, page_size=page_size, cursor=args.cursor
-            )
-        elif args.command == "address-time-stats":
-            result = indexer.address_time_stats(
-                filters, bucket_size, page_size=page_size, cursor=args.cursor
+            records = load_file(args.file)
+            indexer = TxIndexer(records)
+            result = indexer.time_bucket_aggregation(
+                agg_start,
+                agg_end,
+                args.bucket,
+                address=args.address,
+                method=agg_method,
+                page_size=page_size,
+                cursor=args.cursor,
             )
         else:
-            result = indexer.stats(filters)
+            filters = _filters_from_args(args, parser)
+            page_size = None
+            if args.command in (
+                "query",
+                "method-stats",
+                "address-stats",
+                "counterparty-stats",
+                "time-stats",
+                "pair-stats",
+                "address-time-stats",
+            ):
+                page_size = _parse_page_size(args.page_size)
+            bucket_size = None
+            if args.command in ("time-stats", "address-time-stats"):
+                # 缺失、非整数或不大于 0 都在读取数据文件前报 invalid_bucket_size
+                bucket_size = _parse_bucket_size(args.bucket_size)
+            if args.command == "counterparty-stats" and filters["address"] is None:
+                # 缺少 --address 与空白值、address/from/to 冲突一样，
+                # 都在读取数据文件前报 invalid_filter
+                raise InvalidFilterError(
+                    "counterparty-stats 必须指定 --address", None
+                )
+
+            records = load_file(args.file)
+            indexer = TxIndexer(records)
+
+            if args.command == "query":
+                result = indexer.query(
+                    filters, page_size=page_size, cursor=args.cursor
+                )
+            elif args.command == "method-stats":
+                result = indexer.method_stats(
+                    filters, page_size=page_size, cursor=args.cursor
+                )
+            elif args.command == "address-stats":
+                result = indexer.address_stats(
+                    filters, page_size=page_size, cursor=args.cursor
+                )
+            elif args.command == "counterparty-stats":
+                result = indexer.counterparty_stats(
+                    filters, page_size=page_size, cursor=args.cursor
+                )
+            elif args.command == "time-stats":
+                result = indexer.time_stats(
+                    filters, bucket_size, page_size=page_size, cursor=args.cursor
+                )
+            elif args.command == "pair-stats":
+                result = indexer.pair_stats(
+                    filters, page_size=page_size, cursor=args.cursor
+                )
+            elif args.command == "address-time-stats":
+                result = indexer.address_time_stats(
+                    filters, bucket_size, page_size=page_size, cursor=args.cursor
+                )
+            else:
+                result = indexer.stats(filters)
     except TxIndexerError as exc:
         json.dump(exc.to_dict(), sys.stderr, ensure_ascii=False)
         sys.stderr.write("\n")

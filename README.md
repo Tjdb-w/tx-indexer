@@ -33,6 +33,7 @@
 ./tx-indexer time-stats <data.jsonl> --bucket-size SECONDS [选项]
 ./tx-indexer pair-stats <data.jsonl> [选项]
 ./tx-indexer address-time-stats <data.jsonl> --bucket-size SECONDS [选项]
+./tx-indexer time-bucket-aggregation <data.jsonl> --start-time TS --end-time TS --bucket hour|day [选项]
 ```
 
 也可以用 `python3 -m tx_indexer ...`。
@@ -204,6 +205,42 @@
 - `total_groups` 为全部非空（区间, 地址）组数（不是当前页组数）。
 - 末页 `next_cursor` 为 `null`。游标不透明且自校验，绑定 address-time-stats、等价筛选与 `bucket_size`，不绑定 `page-size`；跨命令复用、改变筛选或 `bucket_size`、篡改或解码失败都会报 `invalid_cursor`。
 - 无匹配时：`groups` 为 `[]`、`total_groups` 为 `0`、`next_cursor` 为 `null`。
+
+### time-bucket-aggregation 返回
+
+独立的时间分桶聚合入口：只负责分桶统计，调用方不需要先取明细页再自行汇总。它**不使用**上文的通用筛选选项与左闭右闭时间窗，而是使用自己的参数与左闭右开时间窗：
+
+```bash
+./tx-indexer time-bucket-aggregation <data.jsonl> \
+    --start-time TS --end-time TS --bucket hour|day \
+    [--address ADDR] [--method METHOD ...] [--page-size N] [--cursor TOKEN]
+```
+
+- `--start-time` / `--end-time`：**必填**，非负 UTC 秒整数，时间窗**左闭右开**（含开始时间、不含结束时间）。
+- `--bucket`：**必填**，`hour`（小时按整点切分）或 `day`（自然日按 UTC 日期切分）。
+- `--address ADDR`：可选，精确匹配发送方或接收方。
+- `--method METHOD`：可选，精确匹配方法，可重复出现，集合内任一命中。
+- `--page-size N` / `--cursor TOKEN`：与其他分页命令相同（每页桶数默认 `100`、范围 1..1000）。
+
+所有时间按 UTC 计算。桶从 Unix 纪元对齐（小时桶起点为 3600 的整数倍、日桶起点为 86400 的整数倍）：首桶可早于 `start-time`，末桶只覆盖 `end-time` 之前的数据。输出按 `bucket_start` 升序返回查询范围内的**连续**桶——范围内没有交易的桶同样返回，三个计数均为 `0`，不静默跳过：
+
+```json
+{
+  "buckets": [
+    {"bucket_start": 0, "total_count": 2, "success_count": 2, "failure_count": 0},
+    {"bucket_start": 3600, "total_count": 0, "success_count": 0, "failure_count": 0},
+    {"bucket_start": 7200, "total_count": 1, "success_count": 0, "failure_count": 1}
+  ],
+  "total_buckets": 3,
+  "next_cursor": null
+}
+```
+
+- `total_buckets` 为查询范围内的连续桶总数（含空桶，不是当前页桶数）。
+- 记录 `success` 为 `false` 计入 `failure_count`，否则计入 `success_count`（未携带 `success` 字段的 JSON Lines 记录计入成功）；`total_count = success_count + failure_count`。
+- 末页 `next_cursor` 为 `null`；在末页之后继续翻页返回空 `buckets` 与 `null` 游标。游标不透明且自校验，绑定完整查询条件（`address`、`method`、`start-time`、`end-time`）与桶粒度，**不绑定** `page-size`：相同条件下翻页不重复、不遗漏；跨命令复用（如把其他命令游标用于本命令）、改变任一查询条件或桶粒度、篡改或解码失败都报 `invalid_aggregation_cursor`。
+- 任何参数或游标错误都在返回分页数据之前抛出，不产生部分分页数据；既有 query、stats 与六类分组统计的结果不受本入口影响。
+- Python 入口：`TxIndexer.time_bucket_aggregation(start_time, end_time, bucket, address=None, method=None, page_size=100, cursor=None)`。
 
 ## 增量导入与断点续传
 
@@ -486,6 +523,15 @@ summary = manager.stats("chain-a", normalize_filters(method="transfer"))
 | `invalid_filter` | 筛选值为空白、`--address` 与 `--from-address` / `--to-address` 并用，或 counterparty-stats 缺少 `--address`（读取数据文件前报错） |
 | `invalid_bucket_size` | `--bucket-size` 缺失、非整数或不大于 0（time-stats / address-time-stats，读取数据文件前报错） |
 
+时间分桶聚合（time-bucket-aggregation）使用独立的错误类型与错误码（Python 异常同时提供 `…Error` 后缀别名，如 `InvalidAggregationRangeError is InvalidAggregationRange`），同样输出到 stderr、退出码为 2、`input_line` 为 `null`，且都在读取数据文件前确定（游标错误在读取后、返回任何分页数据前抛出）：
+
+| error | 触发条件 |
+| --- | --- |
+| `invalid_aggregation_range` | 缺少 `--start-time` / `--end-time`、无法解析为非负 UTC 秒整数，或结束时间早于或等于开始时间（左闭右开，读取数据文件前报错） |
+| `unsupported_aggregation_bucket` | `--bucket` 缺失或不是 `hour` / `day`（读取数据文件前报错） |
+| `invalid_aggregation_filter` | `--address` / `--method` 筛选值为空或仅含空白，无法按现有公开语义解释（读取数据文件前报错） |
+| `invalid_aggregation_cursor` | 游标格式错误、解码失败、被篡改，或与当前查询条件（地址、方法、起止时间）/ 桶粒度不一致 |
+
 索引水位与幂等重放（`ReplayManager`）使用 Python 原生异常，不走 CLI
 错误输出：
 
@@ -498,8 +544,8 @@ summary = manager.stats("chain-a", normalize_filters(method="transfer"))
 ## 代码结构
 
 - `tx_indexer/loader.py`：JSON Lines 解析与校验
-- `tx_indexer/engine.py`：筛选、排序、keyset 游标分页、聚合
-- `tx_indexer/cursor.py`：不透明游标编解码（base64url），含独立的导入游标
+- `tx_indexer/engine.py`：筛选、排序、keyset 游标分页、聚合，以及独立的时间分桶聚合（time_bucket_aggregation：连续 hour/day 桶、含空桶、成功/失败计数）
+- `tx_indexer/cursor.py`：不透明游标编解码（base64url），含独立的导入游标与时间分桶聚合游标
 - `tx_indexer/importer.py`：增量交易导入与断点续传
 - `tx_indexer/replay.py`：索引水位与幂等重放（按链水位、原子批次、并发串行化）；`MultiChainReplayManager` 在多个 chain_id 共用入口时按链隔离身份、索引、水位、并发与游标
 - `tx_indexer/errors.py`：异常类型
@@ -508,4 +554,4 @@ summary = manager.stats("chain-a", normalize_filters(method="transfer"))
 
 ## 状态
 
-已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按参与地址分页汇总（address-stats）、按交易对手分页汇总（counterparty-stats）、按固定宽度时间区间分页汇总（time-stats）、按有向交易对分页汇总（pair-stats）、按时间区间 × 参与地址分页汇总（address-time-stats）与领域异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选；`--min-amount` / `--max-amount` 金额闭区间筛选（按十进制整数数值比较、前导零等价、与其他筛选取交集，query/stats/六类分组统计与多链入口全部基于命中交易重算，非法值报 `invalid_amount_filter`、区间倒置报 `invalid_amount_range`，游标按数值等价绑定金额边界）；增量交易导入与断点续传（原子批次、重试判重、四类机器可读拒绝码、独立导入游标）；链重组后缀替换（`replace_from`，原子覆盖已导入高度至链尖、保留更低前缀、旧后缀同名不冲突、四类计数字段与 `INVALID_REPLACEMENT_BATCH` 拒绝码）；索引水位与幂等重放（`ReplayManager.submit` / `status`：按链连续水位、升序分批、整批原子提交、重复跳过、`TransactionConflictError` 冲突停止、`SourceUnavailableError` 断点续传、同链并发合并/等待、不扫描明细的只读状态入口）；多链共用入口 `MultiChainReplayManager`（按链隔离的独立 `ReplayManager`：跨链同哈希属不同交易、异链独立不阻塞、submit/status/query/stats 返回口径不变、query 游标绑定 chain_id 与等价筛选，跨链/改筛选/与单索引游标互用均抛 `InvalidCursorError`；IncrementalImporter、JSON Lines、CLI 与既有输出不变）。
+已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按参与地址分页汇总（address-stats）、按交易对手分页汇总（counterparty-stats）、按固定宽度时间区间分页汇总（time-stats）、按有向交易对分页汇总（pair-stats）、按时间区间 × 参与地址分页汇总（address-time-stats）与领域异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选；`--min-amount` / `--max-amount` 金额闭区间筛选（按十进制整数数值比较、前导零等价、与其他筛选取交集，query/stats/六类分组统计与多链入口全部基于命中交易重算，非法值报 `invalid_amount_filter`、区间倒置报 `invalid_amount_range`，游标按数值等价绑定金额边界）；增量交易导入与断点续传（原子批次、重试判重、四类机器可读拒绝码、独立导入游标）；链重组后缀替换（`replace_from`，原子覆盖已导入高度至链尖、保留更低前缀、旧后缀同名不冲突、四类计数字段与 `INVALID_REPLACEMENT_BATCH` 拒绝码）；索引水位与幂等重放（`ReplayManager.submit` / `status`：按链连续水位、升序分批、整批原子提交、重复跳过、`TransactionConflictError` 冲突停止、`SourceUnavailableError` 断点续传、同链并发合并/等待、不扫描明细的只读状态入口）；多链共用入口 `MultiChainReplayManager`（按链隔离的独立 `ReplayManager`：跨链同哈希属不同交易、异链独立不阻塞、submit/status/query/stats 返回口径不变、query 游标绑定 chain_id 与等价筛选，跨链/改筛选/与单索引游标互用均抛 `InvalidCursorError`；IncrementalImporter、JSON Lines、CLI 与既有输出不变）；时间分桶聚合（`time-bucket-aggregation` / `TxIndexer.time_bucket_aggregation`：必填左闭右开时间窗与 hour/day 桶粒度、可选 address/method，UTC 整点/整日连续桶含空桶零填充、total/success/failure 计数，游标绑定完整查询条件与桶粒度、不绑定 page-size、末页之后为空页与空游标；`invalid_aggregation_range` / `unsupported_aggregation_bucket` / `invalid_aggregation_filter` / `invalid_aggregation_cursor` 四类独立错误，全部先于分页数据抛出，既有查询、聚合统计与游标结果不变）。

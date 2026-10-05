@@ -89,3 +89,34 @@ class TransactionConflictError(TxIndexerError):
     """相同 tx_hash 再次出现但标准化内容（区块、时间、地址、方法）不一致。"""
 
     error = "transaction_conflict"
+
+
+class InvalidAggregationRange(TxIndexerError):
+    """时间分桶聚合的时间范围非法：start_time/end_time 缺失或倒置。"""
+
+    error = "invalid_aggregation_range"
+
+
+class UnsupportedAggregationBucket(TxIndexerError):
+    """时间分桶聚合的桶粒度不是 hour 或 day。"""
+
+    error = "unsupported_aggregation_bucket"
+
+
+class InvalidAggregationFilter(TxIndexerError):
+    """时间分桶聚合的地址或方法筛选值无法按公开语义解释。"""
+
+    error = "invalid_aggregation_filter"
+
+
+class InvalidAggregationCursor(TxIndexerError):
+    """时间分桶聚合游标格式错误、被篡改或与当前查询条件/桶粒度不一致。"""
+
+    error = "invalid_aggregation_cursor"
+
+
+# 错误类型后缀别名：与既有异常命名（…Error）保持一致，两种写法等价
+InvalidAggregationRangeError = InvalidAggregationRange
+UnsupportedAggregationBucketError = UnsupportedAggregationBucket
+InvalidAggregationFilterError = InvalidAggregationFilter
+InvalidAggregationCursorError = InvalidAggregationCursor
