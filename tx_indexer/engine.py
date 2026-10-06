@@ -18,6 +18,9 @@
 
 query 排序：block_number 升序，同高度按 tx_hash 升序。
 method-stats 排序：total_amount 降序、total_count 降序、method 码点升序。
+method-status-stats 在 method-stats 口径上按成功/失败拆分每组计数与金额，
+排序：total_amount 降序、total_count 降序、success_count 降序、
+failure_count 降序、method 码点升序。
 address-stats 排序：total_amount 降序、total_count 降序、send_count 降序、
 receive_count 降序、address 码点升序。
 counterparty-stats 排序键与 address-stats 相同，末级改为 counterparty
@@ -57,6 +60,7 @@ from .cursor import (
     decode_counterparty_stats_cursor,
     decode_cursor,
     decode_method_stats_cursor,
+    decode_method_status_stats_cursor,
     decode_pair_stats_cursor,
     decode_time_bucket_aggregation_cursor,
     decode_time_stats_cursor,
@@ -66,6 +70,7 @@ from .cursor import (
     encode_counterparty_stats_cursor,
     encode_cursor,
     encode_method_stats_cursor,
+    encode_method_status_stats_cursor,
     encode_pair_stats_cursor,
     encode_time_bucket_aggregation_cursor,
     encode_time_stats_cursor,
@@ -567,6 +572,132 @@ class TxIndexer:
             last = page_methods[-1]
             next_cursor = encode_method_stats_cursor(
                 filters, totals[last], counts[last], last
+            )
+        else:
+            next_cursor = None
+
+        return {
+            "groups": groups,
+            "total_groups": total_groups,
+            "next_cursor": next_cursor,
+        }
+
+    def method_status_stats(self, filters, page_size=DEFAULT_PAGE_SIZE,
+                            cursor=None):
+        """按 method 分组并拆分成功/失败计数与金额的分页统计。
+
+        在 :meth:`method_stats` 的分组与金额口径上，把每组的计数与金额
+        进一步按交易状态拆分：记录未携带 success（如回放标准化记录）时
+        按成功处理。返回 {groups, total_groups, next_cursor}；每组含
+        method、total_count、total_amount、avg_amount、success_count、
+        failure_count、success_amount、failure_amount（计数为整数，金额
+        为无前导零十进制整数字符串，avg_amount = total_amount //
+        total_count 向下取整）。
+
+        指定 status 筛选时只统计被选中的状态，另一状态的计数与金额均为
+        0 / ``"0"``；无匹配时 groups 为 []、total_groups 为 0、
+        next_cursor 为 None。顺序：total_amount 降序、total_count 降序、
+        success_count 降序、failure_count 降序、method 的 Unicode 码点
+        升序。游标绑定本命令与等价筛选（含 status，金额/区块边界按数值
+        等价），不绑定 page_size。
+        """
+        self._validate_page_size(page_size)
+
+        totals = {}
+        counts = {}
+        success_counts = {}
+        failure_counts = {}
+        success_amounts = {}
+        failure_amounts = {}
+        for record in self._records:
+            if not _matches(record, filters):
+                continue
+            method = record["method"]
+            value = int(record["amount"])
+            totals[method] = totals.get(method, 0) + value
+            counts[method] = counts.get(method, 0) + 1
+            success_counts.setdefault(method, 0)
+            failure_counts.setdefault(method, 0)
+            success_amounts.setdefault(method, 0)
+            failure_amounts.setdefault(method, 0)
+            if record.get("success", True):
+                success_counts[method] += 1
+                success_amounts[method] += value
+            else:
+                failure_counts[method] += 1
+                failure_amounts[method] += value
+
+        # (-total, -count, -success, -failure, method) 升序即各数值降序、
+        # method 升序，同时得到可直接 bisect 的单调递增键
+        methods = sorted(
+            totals,
+            key=lambda m: (
+                -totals[m],
+                -counts[m],
+                -success_counts[m],
+                -failure_counts[m],
+                m,
+            ),
+        )
+        total_groups = len(methods)
+
+        start = 0
+        if cursor is not None:
+            (
+                after_total,
+                after_count,
+                after_success,
+                after_failure,
+                after_method,
+            ) = decode_method_status_stats_cursor(cursor, filters)
+            keys = [
+                (
+                    -totals[m],
+                    -counts[m],
+                    -success_counts[m],
+                    -failure_counts[m],
+                    m,
+                )
+                for m in methods
+            ]
+            marker = (
+                -after_total,
+                -after_count,
+                -after_success,
+                -after_failure,
+                after_method,
+            )
+            # keyset 续页：排序键严格大于 marker 的第一个位置。
+            # marker 位于两键之间也安全（bisect 取下一键），不会跳过或重复。
+            start = bisect.bisect_left(keys, marker)
+            if start < total_groups and keys[start] == marker:
+                # marker 命中现存分组本身：从其后一组开始
+                start += 1
+
+        end = start + page_size
+        page_methods = methods[start:end]
+        groups = [
+            {
+                "method": method,
+                "total_count": counts[method],
+                "total_amount": str(totals[method]),
+                "avg_amount": str(totals[method] // counts[method]),
+                "success_count": success_counts[method],
+                "failure_count": failure_counts[method],
+                "success_amount": str(success_amounts[method]),
+                "failure_amount": str(failure_amounts[method]),
+            }
+            for method in page_methods
+        ]
+        if end < total_groups:
+            last = page_methods[-1]
+            next_cursor = encode_method_status_stats_cursor(
+                filters,
+                totals[last],
+                counts[last],
+                success_counts[last],
+                failure_counts[last],
+                last,
             )
         else:
             next_cursor = None

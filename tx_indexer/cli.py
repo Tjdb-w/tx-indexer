@@ -1,5 +1,6 @@
 """命令行入口：``tx-indexer query`` / ``stats`` / ``status-stats`` /
-``method-stats`` / ``address-stats`` / ``address-flow-stats`` / ``counterparty-stats`` /
+``method-stats`` / ``method-status-stats`` / ``address-stats`` /
+``address-flow-stats`` / ``counterparty-stats`` /
 ``time-stats`` / ``pair-stats`` / ``address-time-stats`` /
 ``time-bucket-aggregation``。
 
@@ -8,6 +9,7 @@
     tx-indexer stats <data.jsonl> [筛选选项]
     tx-indexer status-stats <data.jsonl> [筛选选项]
     tx-indexer method-stats <data.jsonl> [筛选与分页选项]
+    tx-indexer method-status-stats <data.jsonl> [筛选与分页选项]
     tx-indexer address-stats <data.jsonl> [筛选与分页选项]
     tx-indexer address-flow-stats <data.jsonl> [筛选与分页选项]
     tx-indexer counterparty-stats <data.jsonl> --address ADDR [筛选与分页选项]
@@ -193,6 +195,24 @@ def build_parser():
         help="每页分组数，1 到 1000，默认 100",
     )
     method_stats_parser.add_argument(
+        "--cursor", help="上一页返回的 next_cursor"
+    )
+
+    method_status_stats_parser = subparsers.add_parser(
+        "method-status-stats",
+        help="按 method 分组并拆分成功/失败计数与金额的分页汇总"
+             "（返回 groups/total_groups/next_cursor）",
+    )
+    method_status_stats_parser.add_argument(
+        "file", help="JSON Lines 数据文件路径"
+    )
+    _add_filter_args(method_status_stats_parser)
+    method_status_stats_parser.add_argument(
+        "--page-size",
+        default=str(DEFAULT_PAGE_SIZE),
+        help="每页分组数，1 到 1000，默认 100",
+    )
+    method_status_stats_parser.add_argument(
         "--cursor", help="上一页返回的 next_cursor"
     )
 
@@ -439,6 +459,7 @@ def main(argv=None):
             if args.command in (
                 "query",
                 "method-stats",
+                "method-status-stats",
                 "address-stats",
                 "address-flow-stats",
                 "counterparty-stats",
@@ -467,6 +488,10 @@ def main(argv=None):
                 )
             elif args.command == "method-stats":
                 result = indexer.method_stats(
+                    filters, page_size=page_size, cursor=args.cursor
+                )
+            elif args.command == "method-status-stats":
+                result = indexer.method_status_stats(
                     filters, page_size=page_size, cursor=args.cursor
                 )
             elif args.command == "address-stats":

@@ -48,6 +48,8 @@ SCOPE_QUERY = "query"
 #: 多链入口 query 的作用域标识（额外绑定 chain_id，与单索引 query 互不可复用）
 SCOPE_MULTICHAIN_QUERY = "multichain-query"
 SCOPE_METHOD_STATS = "method-stats"
+#: 按 method 拆分成功/失败计数与金额的分页统计作用域标识
+SCOPE_METHOD_STATUS_STATS = "method-status-stats"
 SCOPE_ADDRESS_STATS = "address-stats"
 SCOPE_COUNTERPARTY_STATS = "counterparty-stats"
 SCOPE_TIME_STATS = "time-stats"
@@ -268,6 +270,58 @@ def decode_method_stats_cursor(token, filters):
         raise InvalidCursorError("游标位置信息非法", None)
 
     return after[0], after[1], after[2]
+
+
+def encode_method_status_stats_cursor(filters, after_total_amount,
+                                      after_total_count, after_success_count,
+                                      after_failure_count, after_method):
+    """method-status-stats 游标：绑定命令与等价筛选（含 status），不绑定
+    page_size。"""
+    payload = {
+        "v": _CURSOR_VERSION,
+        "c": SCOPE_METHOD_STATUS_STATS,
+        "f": _canonical_filters(filters),
+        "after": [
+            after_total_amount,
+            after_total_count,
+            after_success_count,
+            after_failure_count,
+            after_method,
+        ],
+    }
+    return _encode_payload(payload)
+
+
+def decode_method_status_stats_cursor(token, filters):
+    """解码并校验 method-status-stats 游标。
+
+    返回 exclusive marker ``(total_amount, total_count, success_count,
+    failure_count, method)``。
+    """
+    payload = _decode_payload(token, filters, SCOPE_METHOD_STATUS_STATS)
+
+    after = payload.get("after")
+    if (
+        not isinstance(after, list)
+        or len(after) != 5
+        or not isinstance(after[0], int)
+        or isinstance(after[0], bool)
+        or after[0] < 0
+        or not isinstance(after[1], int)
+        or isinstance(after[1], bool)
+        or after[1] < 1
+        or not isinstance(after[2], int)
+        or isinstance(after[2], bool)
+        or after[2] < 0
+        or not isinstance(after[3], int)
+        or isinstance(after[3], bool)
+        or after[3] < 0
+        or not isinstance(after[4], str)
+        or after[4] == ""
+    ):
+        raise InvalidCursorError("游标位置信息非法", None)
+
+    return after[0], after[1], after[2], after[3], after[4]
 
 
 def encode_address_stats_cursor(filters, after_total_amount, after_total_count,
