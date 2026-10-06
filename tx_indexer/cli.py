@@ -1,6 +1,7 @@
 """命令行入口：``tx-indexer query`` / ``stats`` / ``method-stats`` /
 ``address-stats`` / ``counterparty-stats`` / ``time-stats`` /
-``pair-stats`` / ``address-time-stats`` / ``time-bucket-aggregation``。
+``pair-stats`` / ``address-time-stats`` / ``address-flow-stats`` /
+``time-bucket-aggregation``。
 
 用法：
     tx-indexer query <data.jsonl> [筛选与分页选项]
@@ -11,6 +12,7 @@
     tx-indexer time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
     tx-indexer pair-stats <data.jsonl> [筛选与分页选项]
     tx-indexer address-time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
+    tx-indexer address-flow-stats <data.jsonl> [筛选与分页选项]
     tx-indexer time-bucket-aggregation <data.jsonl> --start-time TS --end-time TS --bucket hour|day [选项]
 
 领域错误（invalid_transaction / duplicate_transaction / invalid_time_range /
@@ -263,6 +265,24 @@ def build_parser():
         "--cursor", help="上一页返回的 next_cursor"
     )
 
+    address_flow_stats_parser = subparsers.add_parser(
+        "address-flow-stats",
+        help="按参与地址拆分发送/接收资金流向"
+             "（返回 groups/total_groups/next_cursor）",
+    )
+    address_flow_stats_parser.add_argument(
+        "file", help="JSON Lines 数据文件路径"
+    )
+    _add_filter_args(address_flow_stats_parser)
+    address_flow_stats_parser.add_argument(
+        "--page-size",
+        default=str(DEFAULT_PAGE_SIZE),
+        help="每页分组数，1 到 1000，默认 100",
+    )
+    address_flow_stats_parser.add_argument(
+        "--cursor", help="上一页返回的 next_cursor"
+    )
+
     time_bucket_parser = subparsers.add_parser(
         "time-bucket-aggregation",
         help="按小时/自然日连续分桶聚合"
@@ -406,6 +426,7 @@ def main(argv=None):
                 "time-stats",
                 "pair-stats",
                 "address-time-stats",
+                "address-flow-stats",
             ):
                 page_size = _parse_page_size(args.page_size)
             bucket_size = None
@@ -449,6 +470,10 @@ def main(argv=None):
             elif args.command == "address-time-stats":
                 result = indexer.address_time_stats(
                     filters, bucket_size, page_size=page_size, cursor=args.cursor
+                )
+            elif args.command == "address-flow-stats":
+                result = indexer.address_flow_stats(
+                    filters, page_size=page_size, cursor=args.cursor
                 )
             else:
                 result = indexer.stats(filters)

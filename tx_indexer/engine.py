@@ -29,6 +29,13 @@ address-time-stats 先按从 Unix 纪元对齐、左闭右开的固定宽度时�
 返回非空（区间, 地址）组，顺序为 bucket_start 升序、total_amount
 降序、total_count 降序、send_count 降序、receive_count 降序、
 address 码点升序。
+address-flow-stats 按参与地址拆分资金流向：amount 计入
+from_address 的 sent_amount 与 to_address 的 received_amount
+（自转账两方都计），net_amount 为 sent_amount 减 received_amount
+（可负），send_count / receive_count / total_count 统计发送、接收、
+参与次数（自转账 total_count 只计一次），顺序为 net_amount 降序、
+sent_amount 降序、received_amount 降序、total_count 降序、
+address 码点升序。
 time-bucket-aggregation 是与上述入口相互独立的时间分桶聚合：必填
 左闭右开时间窗（UTC 秒）与 hour/day 桶粒度，可选 address/method；
 按桶起点升序返回连续桶（含无交易的零计数桶），每桶含
@@ -42,6 +49,7 @@ total_count、success_count、failure_count，游标绑定完整查询条件与
 import bisect
 
 from .cursor import (
+    decode_address_flow_stats_cursor,
     decode_address_stats_cursor,
     decode_address_time_stats_cursor,
     decode_counterparty_stats_cursor,
@@ -50,6 +58,7 @@ from .cursor import (
     decode_pair_stats_cursor,
     decode_time_bucket_aggregation_cursor,
     decode_time_stats_cursor,
+    encode_address_flow_stats_cursor,
     encode_address_stats_cursor,
     encode_address_time_stats_cursor,
     encode_counterparty_stats_cursor,
@@ -1070,6 +1079,138 @@ class TxIndexer:
                 send_counts[last_key],
                 receive_counts[last_key],
                 last_address,
+            )
+        else:
+            next_cursor = None
+
+        return {
+            "groups": groups,
+            "total_groups": total_groups,
+            "next_cursor": next_cursor,
+        }
+
+    def address_flow_stats(self, filters, page_size=DEFAULT_PAGE_SIZE,
+                           cursor=None):
+        """按参与地址拆分发送 / 接收资金流向的分页统计。
+
+        每条匹配交易的 amount（无前导零十进制整数）计入 from_address 的
+        sent_amount 与 to_address 的 received_amount；自转账
+        （from == to）两方都计（sent_amount 与 received_amount 各累计
+        一次）。net_amount 为 sent_amount 减 received_amount，输出为
+        可带负号的十进制整数字符串，零为 ``"0"``。send_count /
+        receive_count 分别统计发送、接收次数，total_count 统计参与次数
+        （自转账只计一次）。
+
+        返回 {groups, total_groups, next_cursor}；每组含 address、
+        sent_amount、received_amount、net_amount、send_count、
+        receive_count、total_count（金额为十进制整数字符串，不使用
+        浮点）。顺序：net_amount 降序、sent_amount 降序、
+        received_amount 降序、total_count 降序、address 的 Unicode
+        码点升序。无命中时 groups 为空、total_groups 为 0、
+        next_cursor 为 None。游标绑定本命令与等价筛选，不绑定
+        page_size。
+        """
+        self._validate_page_size(page_size)
+
+        sent_amounts = {}
+        received_amounts = {}
+        send_counts = {}
+        receive_counts = {}
+        total_counts = {}
+        for record in self._records:
+            if not _matches(record, filters):
+                continue
+            value = int(record["amount"])
+            frm = record["from_address"]
+            to = record["to_address"]
+
+            sent_amounts[frm] = sent_amounts.get(frm, 0) + value
+            send_counts[frm] = send_counts.get(frm, 0) + 1
+            total_counts[frm] = total_counts.get(frm, 0) + 1
+            received_amounts.setdefault(frm, 0)
+            receive_counts.setdefault(frm, 0)
+
+            received_amounts[to] = received_amounts.get(to, 0) + value
+            receive_counts[to] = receive_counts.get(to, 0) + 1
+            sent_amounts.setdefault(to, 0)
+            send_counts.setdefault(to, 0)
+            if to != frm:
+                # 自转账的 total_count 只计一次（上面发送侧已计）
+                total_counts[to] = total_counts.get(to, 0) + 1
+
+        def _net(address):
+            return sent_amounts[address] - received_amounts[address]
+
+        # (-net, -sent, -received, -total_count, address) 升序即各数值
+        # 降序、address 码点升序，同时得到可直接 bisect 的单调递增键
+        addresses = sorted(
+            total_counts,
+            key=lambda a: (
+                -_net(a),
+                -sent_amounts[a],
+                -received_amounts[a],
+                -total_counts[a],
+                a,
+            ),
+        )
+        total_groups = len(addresses)
+
+        start = 0
+        if cursor is not None:
+            (
+                after_net,
+                after_sent,
+                after_received,
+                after_total_count,
+                after_address,
+            ) = decode_address_flow_stats_cursor(cursor, filters)
+            keys = [
+                (
+                    -_net(a),
+                    -sent_amounts[a],
+                    -received_amounts[a],
+                    -total_counts[a],
+                    a,
+                )
+                for a in addresses
+            ]
+            marker = (
+                -after_net,
+                -after_sent,
+                -after_received,
+                -after_total_count,
+                after_address,
+            )
+            # keyset 续页：排序键严格大于 marker 的第一个位置。
+            # marker 位于两键之间也安全（bisect 取下一键），不会跳过或重复。
+            start = bisect.bisect_left(keys, marker)
+            if start < total_groups and keys[start] == marker:
+                # marker 命中现存分组本身：从其后一组开始
+                start += 1
+
+        end = start + page_size
+        page_addresses = addresses[start:end]
+        groups = [
+            {
+                "address": address,
+                "sent_amount": str(sent_amounts[address]),
+                "received_amount": str(received_amounts[address]),
+                "net_amount": str(_net(address)),
+                "send_count": send_counts[address],
+                "receive_count": receive_counts[address],
+                "total_count": total_counts[address],
+            }
+            for address in page_addresses
+        ]
+        if end < total_groups:
+            last = page_addresses[-1]
+            next_cursor = encode_address_flow_stats_cursor(
+                filters,
+                _net(last),
+                sent_amounts[last],
+                received_amounts[last],
+                total_counts[last],
+                last,
             )
         else:
             next_cursor = None
