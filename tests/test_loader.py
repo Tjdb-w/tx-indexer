@@ -107,6 +107,51 @@ class LoaderTest(unittest.TestCase):
         self.assertEqual(ctx.exception.error, "duplicate_transaction")
         self.assertEqual(ctx.exception.input_line, 2)
 
+    def test_success_defaults_to_true(self):
+        import json
+
+        obj = {
+            "tx_hash": "x", "block_number": 1, "timestamp": 2,
+            "from_address": "a", "to_address": "b", "method": "m",
+            "amount": "1",
+        }
+        record = load_lines([json.dumps(obj)])[0]
+        self.assertIs(record["success"], True)
+
+    def test_success_explicit_booleans(self):
+        import json
+
+        base = {
+            "tx_hash": "x", "block_number": 1, "timestamp": 2,
+            "from_address": "a", "to_address": "b", "method": "m",
+            "amount": "1",
+        }
+        for value in (True, False):
+            obj = dict(base, success=value)
+            self.assertIs(
+                load_lines([json.dumps(obj)])[0]["success"], value
+            )
+
+    def test_success_non_boolean_rejected_with_line_no(self):
+        import json
+
+        base = {
+            "tx_hash": "x", "block_number": 1, "timestamp": 2,
+            "from_address": "a", "to_address": "b", "method": "m",
+            "amount": "1",
+        }
+        # 0 / 1 不会因 bool 是 int 子类而被误接受；字符串、null 同样非法
+        for bad in (0, 1, "true", "false", "", None):
+            obj = dict(base, success=bad)
+            with self.assertRaises(InvalidTransactionError) as ctx:
+                load_lines([VALID, json.dumps(obj)])
+            self.assertEqual(ctx.exception.input_line, 2)
+
+    def test_other_extra_field_still_rejected(self):
+        line = VALID[:-1] + ', "fee": "1"}'
+        with self.assertRaises(InvalidTransactionError):
+            load_lines([line])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -74,6 +74,13 @@ class InvalidFilterError(TxIndexerError):
     error = "invalid_filter"
 
 
+class InvalidStatusFilterError(TxIndexerError):
+    """状态筛选非法：空或空白、大小写变体、非 success/failure 文本，
+    或 Python 调用传入非字符串。"""
+
+    error = "invalid_status_filter"
+
+
 class InvalidPageSizeError(TxIndexerError):
     """page_size 越界（不在 1..1000）或无法解析。"""
 

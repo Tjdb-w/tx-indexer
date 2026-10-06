@@ -21,6 +21,10 @@
 删除或改变任一边界后复用旧游标报 InvalidCursorError；未携带区块
 边界字段的旧游标只在本次未指定任一边界时可续翻。
 
+状态筛选（status：``"success"`` / ``"failure"`` / 缺省 None）同样
+进入筛选快照：改变状态后复用旧游标报 InvalidCursorError；未携带
+status 字段的旧游标只在本次未指定状态时可续翻。
+
 时间分桶聚合游标（scope ``time-bucket-aggregation``）只绑定该入口的
 完整查询条件（address、method、起止时间）与桶粒度（hour/day），
 解码失败或条件不一致抛 InvalidAggregationCursor，与其余分页游标
@@ -104,6 +108,7 @@ def _canonical_filters(filters):
         "max_amount": _as_canonical_amount(filters.get("max_amount")),
         "min_block": _as_canonical_block(filters.get("min_block")),
         "max_block": _as_canonical_block(filters.get("max_block")),
+        "status": filters.get("status"),
     }
 
 
