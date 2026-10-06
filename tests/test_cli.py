@@ -1702,5 +1702,211 @@ class AmountFilterCliTest(unittest.TestCase):
         self.assertEqual([t["tx_hash"] for t in page2["transactions"]], ["h2"])
 
 
+STATUS_DATA = [
+    {"tx_hash": "s1", "block_number": 1, "timestamp": 10,
+     "from_address": "alice", "to_address": "bob",
+     "method": "transfer", "amount": "100", "success": True},
+    {"tx_hash": "f1", "block_number": 2, "timestamp": 20,
+     "from_address": "bob", "to_address": "alice",
+     "method": "approve", "amount": "30", "success": False},
+    {"tx_hash": "s2", "block_number": 2, "timestamp": 30,
+     "from_address": "alice", "to_address": "carol",
+     "method": "transfer", "amount": "5"},
+]
+
+
+class StatusCliTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "data.jsonl")
+        with open(self.path, "w", encoding="utf-8") as fh:
+            for obj in STATUS_DATA:
+                fh.write(json.dumps(obj) + "\n")
+        self.missing = os.path.join(self.tmp.name, "missing.jsonl")
+        self._stdout, self._stderr = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+
+    def tearDown(self):
+        sys.stdout, sys.stderr = self._stdout, self._stderr
+        self.tmp.cleanup()
+
+    def _run(self, argv):
+        sys.stdout.seek(0)
+        sys.stdout.truncate(0)
+        sys.stderr.seek(0)
+        sys.stderr.truncate(0)
+        code = main(argv)
+        out = sys.stdout.getvalue()
+        err = sys.stderr.getvalue()
+        return code, json.loads(out) if out.strip() else None, err
+
+    def test_query_status_success_and_failure(self):
+        code, page, _ = self._run(["query", self.path, "--status", "success"])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page["transactions"]],
+                         ["s1", "s2"])
+        self.assertEqual(page["total"], 2)
+        self.assertNotIn("success", page["transactions"][0])
+
+        code, page, _ = self._run(["query", self.path, "--status", "failure"])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page["transactions"]], ["f1"])
+
+    def test_status_intersects_other_filters(self):
+        code, page, _ = self._run([
+            "query", self.path, "--status", "success",
+            "--method", "transfer", "--min-amount", "10",
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page["transactions"]], ["s1"])
+
+    def test_status_stats_default(self):
+        code, result, err = self._run(["status-stats", self.path])
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(result, {
+            "total_count": 3,
+            "success_count": 2,
+            "failure_count": 1,
+            "success_amount": "105",
+            "failure_amount": "30",
+        })
+
+    def test_status_stats_with_status_filter(self):
+        code, result, _ = self._run(
+            ["status-stats", self.path, "--status", "failure"])
+        self.assertEqual(code, 0)
+        self.assertEqual(result, {
+            "total_count": 1,
+            "success_count": 0,
+            "failure_count": 1,
+            "success_amount": "0",
+            "failure_amount": "30",
+        })
+
+    def test_status_stats_empty(self):
+        code, result, _ = self._run(
+            ["status-stats", self.path, "--method", "nope"])
+        self.assertEqual(code, 0)
+        self.assertEqual(result, {
+            "total_count": 0,
+            "success_count": 0,
+            "failure_count": 0,
+            "success_amount": "0",
+            "failure_amount": "0",
+        })
+
+    def test_status_works_on_group_commands(self):
+        # 失败交易只有 f1（bob→alice approve）：按 method/对手/交易对
+        # 各为 1 组；按参与地址（address-stats / address-flow-stats）
+        # 与时间区间 × 地址（address-time-stats）bob、alice 各为一组。
+        single_group = ("method-stats", "pair-stats")
+        two_group = ("address-stats", "address-flow-stats")
+        for command in single_group:
+            code, result, err = self._run(
+                [command, self.path, "--status", "failure"])
+            self.assertEqual(code, 0, msg=(command, err))
+            self.assertEqual(result["total_groups"], 1, msg=command)
+        for command in two_group:
+            code, result, err = self._run(
+                [command, self.path, "--status", "failure"])
+            self.assertEqual(code, 0, msg=(command, err))
+            self.assertEqual(result["total_groups"], 2, msg=command)
+        code, result, _ = self._run([
+            "counterparty-stats", self.path,
+            "--address", "alice", "--status", "failure"])
+        self.assertEqual(code, 0)
+        self.assertEqual(result["total_groups"], 1)
+        code, result, _ = self._run([
+            "time-stats", self.path, "--bucket-size", "60",
+            "--status", "failure"])
+        self.assertEqual(code, 0)
+        self.assertEqual(result["total_groups"], 1)
+        code, result, _ = self._run([
+            "address-time-stats", self.path, "--bucket-size", "60",
+            "--status", "failure"])
+        self.assertEqual(code, 0)
+        self.assertEqual(result["total_groups"], 2)
+
+    def test_invalid_status_before_file_read(self):
+        for bad in ("Success", "FAILURE", "succeed", "", "   "):
+            code, out, err = self._run(
+                ["query", self.missing, "--status", bad])
+            self.assertEqual(code, 2)
+            self.assertIsNone(out)
+            payload = json.loads(err)
+            self.assertEqual(payload["error"], "invalid_status_filter")
+            self.assertIsNone(payload["input_line"])
+
+    def test_invalid_status_on_stats_commands(self):
+        for command in ("stats", "status-stats", "method-stats"):
+            code, out, err = self._run(
+                [command, self.missing, "--status", "no"])
+            self.assertEqual(code, 2, msg=command)
+            self.assertIsNone(out)
+            self.assertEqual(
+                json.loads(err)["error"], "invalid_status_filter")
+
+    def test_status_cursor_binding(self):
+        code, page1, _ = self._run(
+            ["query", self.path, "--status", "success", "--page-size", "1"])
+        self.assertEqual(code, 0)
+        cursor = page1["next_cursor"]
+        # 同条件可续翻
+        code, page2, _ = self._run([
+            "query", self.path, "--status", "success",
+            "--page-size", "1", "--cursor", cursor])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page2["transactions"]], ["s2"])
+        # 改状态
+        code, out, err = self._run([
+            "query", self.path, "--status", "failure",
+            "--page-size", "1", "--cursor", cursor])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        self.assertEqual(json.loads(err)["error"], "invalid_cursor")
+        # 去掉 status
+        code, out, err = self._run([
+            "query", self.path, "--page-size", "1", "--cursor", cursor])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(err)["error"], "invalid_cursor")
+
+    def test_old_cursor_without_status_continues_when_no_status(self):
+        code, page1, _ = self._run(
+            ["query", self.path, "--page-size", "1"])
+        self.assertEqual(code, 0)
+        cursor = page1["next_cursor"]
+        # 不带 status 续翻 OK
+        code, page2, _ = self._run([
+            "query", self.path, "--page-size", "1", "--cursor", cursor])
+        self.assertEqual(code, 0)
+        self.assertEqual([t["tx_hash"] for t in page2["transactions"]], ["f1"])
+        # 带 status 失效
+        code, out, err = self._run([
+            "query", self.path, "--status", "success", "--cursor", cursor])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(err)["error"], "invalid_cursor")
+
+    def test_bad_success_in_data_is_invalid_transaction(self):
+        bad = os.path.join(self.tmp.name, "bad.jsonl")
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(STATUS_DATA[0]) + "\n")
+            second = dict(STATUS_DATA[1], success=0)
+            fh.write(json.dumps(second) + "\n")
+        code, out, err = self._run(["query", bad])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_transaction")
+        self.assertEqual(payload["input_line"], 2)
+
+    def test_time_bucket_aggregation_ignores_status_flag(self):
+        # time-bucket-aggregation 使用独立参数，不接受 --status
+        with self.assertRaises(SystemExit):
+            main(["time-bucket-aggregation", self.path,
+                  "--start-time", "0", "--end-time", "100",
+                  "--bucket", "hour", "--status", "success"])
+
+
 if __name__ == "__main__":
     unittest.main()

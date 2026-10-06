@@ -6,6 +6,7 @@
 用法：
     tx-indexer query <data.jsonl> [筛选与分页选项]
     tx-indexer stats <data.jsonl> [筛选选项]
+    tx-indexer status-stats <data.jsonl> [筛选选项]
     tx-indexer method-stats <data.jsonl> [筛选与分页选项]
     tx-indexer address-stats <data.jsonl> [筛选与分页选项]
     tx-indexer address-flow-stats <data.jsonl> [筛选与分页选项]
@@ -18,7 +19,7 @@
 领域错误（invalid_transaction / duplicate_transaction / invalid_time_range /
 invalid_page_size / invalid_cursor / invalid_filter / invalid_bucket_size /
 invalid_amount_filter / invalid_amount_range / invalid_block_filter /
-invalid_block_range / invalid_aggregation_range /
+invalid_block_range / invalid_status_filter / invalid_aggregation_range /
 unsupported_aggregation_bucket / invalid_aggregation_filter /
 invalid_aggregation_cursor）
 以 JSON 对象输出到 stderr，退出码 2：
@@ -86,6 +87,10 @@ def _add_filter_args(parser):
     parser.add_argument(
         "--max-block",
         help="区块高度上界（非负十进制整数，含端点）",
+    )
+    parser.add_argument(
+        "--status",
+        help="按成功状态筛选：success（成功）或 failure（失败），缺省不筛",
     )
 
 
@@ -163,6 +168,14 @@ def build_parser():
     )
     stats_parser.add_argument("file", help="JSON Lines 数据文件路径")
     _add_filter_args(stats_parser)
+
+    status_stats_parser = subparsers.add_parser(
+        "status-stats",
+        help="按成功/失败状态聚合统计"
+             "（返回 total/success/failure 的计数与金额）",
+    )
+    status_stats_parser.add_argument("file", help="JSON Lines 数据文件路径")
+    _add_filter_args(status_stats_parser)
 
     method_stats_parser = subparsers.add_parser(
         "method-stats",
@@ -362,6 +375,7 @@ def _filters_from_args(args, parser):
         max_amount=args.max_amount,
         min_block=min_block,
         max_block=max_block,
+        status=args.status,
     )
 
 
@@ -475,6 +489,9 @@ def main(argv=None):
                 result = indexer.address_time_stats(
                     filters, bucket_size, page_size=page_size, cursor=args.cursor
                 )
+            elif args.command == "status-stats":
+                # 复用与 query 相同的筛选（含 --status），但不使用游标分页
+                result = indexer.status_stats(filters)
             else:
                 result = indexer.stats(filters)
     except TxIndexerError as exc:

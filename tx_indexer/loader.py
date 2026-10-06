@@ -8,8 +8,14 @@
 - ``from_address`` / ``to_address`` / ``method``：非空字符串
 - ``amount``：非负十进制整数字符串（如 ``"1000"``，不接受数字类型、负号、小数点）
 
-任何解析或校验失败抛 :class:`~tx_indexer.errors.InvalidTransactionError`，
-``input_line`` 为 1 起始的物理行号；``tx_hash`` 冲突抛
+另有可选字段：
+
+- ``success``：布尔值，标记交易成功与否；缺省视为 ``true``。
+  ``0`` / ``1``、字符串、``null`` 等非布尔值一律非法。
+
+除该可选字段外的任何未定义字段均视为非法。任何解析或校验失败抛
+:class:`~tx_indexer.errors.InvalidTransactionError`，``input_line`` 为
+1 起始的物理行号；``tx_hash`` 冲突抛
 :class:`~tx_indexer.errors.DuplicateTransactionError`。
 """
 
@@ -27,6 +33,8 @@ _FIELDS = (
     "method",
     "amount",
 )
+#: 允许携带的可选字段（其余额外字段仍属非法）
+_OPTIONAL_FIELDS = ("success",)
 _AMOUNT_RE = re.compile(r"[0-9]+")
 
 
@@ -50,7 +58,8 @@ def parse_record(obj, line_no):
         raise InvalidTransactionError(
             "缺少字段：%s" % ", ".join(missing), line_no
         )
-    extra = sorted(keys - set(_FIELDS))
+    allowed = set(_FIELDS) | set(_OPTIONAL_FIELDS)
+    extra = sorted(keys - allowed)
     if extra:
         raise InvalidTransactionError(
             "存在未定义字段：%s" % ", ".join(extra), line_no
@@ -84,6 +93,14 @@ def parse_record(obj, line_no):
             "amount 必须为非负十进制整数字符串", line_no
         )
 
+    # success 可选，只接受布尔字面量 true/false；缺省视为成功。
+    # 0/1、字符串、null 等都不是布尔值，必须报错并保留物理行号。
+    success = obj.get("success", True)
+    if not isinstance(success, bool):
+        raise InvalidTransactionError(
+            "success 必须为布尔值 true 或 false", line_no
+        )
+
     return {
         "tx_hash": tx_hash,
         "block_number": block_number,
@@ -92,6 +109,7 @@ def parse_record(obj, line_no):
         "to_address": obj["to_address"],
         "method": obj["method"],
         "amount": amount,
+        "success": success,
     }
 
 

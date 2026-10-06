@@ -107,6 +107,53 @@ class LoaderTest(unittest.TestCase):
         self.assertEqual(ctx.exception.error, "duplicate_transaction")
         self.assertEqual(ctx.exception.input_line, 2)
 
+    def test_success_explicit_true_false(self):
+        import json
+
+        base = {
+            "tx_hash": "x", "block_number": 1, "timestamp": 2,
+            "from_address": "a", "to_address": "b", "method": "m",
+            "amount": "1",
+        }
+        ok = dict(base, success=True)
+        bad = dict(base, tx_hash="y", success=False)
+        records = load_lines([json.dumps(ok), json.dumps(bad)])
+        self.assertIs(records[0]["success"], True)
+        self.assertIs(records[1]["success"], False)
+
+    def test_success_defaults_to_true(self):
+        records = load_lines([VALID])
+        self.assertIs(records[0]["success"], True)
+
+    def test_success_non_bool_rejected_with_line_no(self):
+        import json
+
+        base = {
+            "tx_hash": "x", "block_number": 1, "timestamp": 2,
+            "from_address": "a", "to_address": "b", "method": "m",
+            "amount": "1",
+        }
+        for index, bad in enumerate((0, 1, "true", "false", "", None), start=1):
+            line = json.dumps(dict(base, success=bad))
+            with self.assertRaises(InvalidTransactionError) as ctx:
+                load_lines([VALID, line])
+            self.assertEqual(ctx.exception.error, "invalid_transaction")
+            # 非法记录在物理第 2 行，必须保留行号
+            self.assertEqual(ctx.exception.input_line, 2)
+
+    def test_success_plus_unknown_extra_rejected(self):
+        # success 合法，但其余额外字段仍然非法
+        import json
+
+        line = json.dumps({
+            "tx_hash": "x", "block_number": 1, "timestamp": 2,
+            "from_address": "a", "to_address": "b", "method": "m",
+            "amount": "1", "success": True, "extra": 9,
+        })
+        with self.assertRaises(InvalidTransactionError) as ctx:
+            load_lines([line])
+        self.assertIn("extra", ctx.exception.message)
+
 
 if __name__ == "__main__":
     unittest.main()

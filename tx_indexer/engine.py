@@ -76,6 +76,7 @@ from .errors import (
     InvalidBucketSizeError,
     InvalidFilterError,
     InvalidPageSizeError,
+    InvalidStatusFilterError,
     InvalidTimeRangeError,
     UnsupportedAggregationBucket,
 )
@@ -83,6 +84,13 @@ from .loader import _AMOUNT_RE
 
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 1000
+
+#: 状态筛选：只匹配成功交易（记录 success 为 true 或缺省）
+STATUS_SUCCESS = "success"
+#: 状态筛选：只匹配失败交易（记录 success 为 false）
+STATUS_FAILURE = "failure"
+#: 状态筛选允许的取值（缺省 None 表示不按状态筛选）
+_STATUS_VALUES = (STATUS_SUCCESS, STATUS_FAILURE)
 
 #: 时间分桶聚合的小时桶粒度
 AGGREGATION_GRANULARITY_HOUR = "hour"
@@ -151,7 +159,8 @@ def _normalize_block_bound(name, value):
 
 def normalize_filters(address=None, method=None, start_time=None, end_time=None,
                       from_address=None, to_address=None, min_amount=None,
-                      max_amount=None, min_block=None, max_block=None):
+                      max_amount=None, min_block=None, max_block=None,
+                      status=None):
     """校验并归一化筛选条件。
 
     ``method`` / ``from_address`` / ``to_address`` 接受单个字符串或
@@ -162,6 +171,9 @@ def normalize_filters(address=None, method=None, start_time=None, end_time=None,
     ``min_block`` / ``max_block`` 接受非负整数（不含布尔值），闭区间，
     不给为 None；非整数值、布尔值或负数抛 InvalidBlockFilterError，
     最小值大于最大值抛 InvalidBlockRangeError。
+    ``status`` 只接受精确字符串 ``"success"`` / ``"failure"``，不给为
+    None（不按状态筛选）；空字符串、纯空白、大小写变体、其他文本或
+    Python 非字符串值抛 InvalidStatusFilterError。
     """
     if address is not None and (
         not isinstance(address, str) or address.strip() == ""
@@ -175,6 +187,15 @@ def normalize_filters(address=None, method=None, start_time=None, end_time=None,
     if address is not None and (from_set is not None or to_set is not None):
         raise InvalidFilterError(
             "address 不能与 from_address / to_address 同时使用", None
+        )
+    # status 必须缺省或为精确的 success/failure：空白、大小写变体
+    # （"Success"）、其他文本或 Python 非字符串（0/1/True/None 等）
+    # 都在读取数据文件前报 invalid_status_filter
+    if status is not None and (
+        not isinstance(status, str) or status not in _STATUS_VALUES
+    ):
+        raise InvalidStatusFilterError(
+            "status 筛选只能是 success 或 failure", None
         )
     for name, value in (("start_time", start_time), ("end_time", end_time)):
         if value is not None and (
@@ -230,6 +251,7 @@ def normalize_filters(address=None, method=None, start_time=None, end_time=None,
         "max_amount": max_bound,
         "min_block": min_block_bound,
         "max_block": max_block_bound,
+        "status": status,
     }
 
 
@@ -268,6 +290,15 @@ def _matches(record, filters):
         return False
     if filters["max_block"] is not None and block_number > filters["max_block"]:
         return False
+    status = filters.get("status")
+    if status is not None:
+        # 与其余筛选取交集：success 只匹配 true（缺省亦为 true），
+        # failure 只匹配 false
+        record_success = record.get("success", True)
+        if status == STATUS_SUCCESS and record_success is not True:
+            return False
+        if status == STATUS_FAILURE and record_success is not False:
+            return False
     return True
 
 
@@ -446,6 +477,39 @@ class TxIndexer:
             "min_amount": str(min_amount),
             "max_amount": str(max_amount),
             "avg_amount": str(total_amount // count),
+        }
+
+    def status_stats(self, filters):
+        """按成功/失败状态聚合统计（忽略分页，复用与 query 相同的筛选）。
+
+        返回 ``{total_count, success_count, failure_count,
+        success_amount, failure_amount}``：金额均为十进制整数字符串，
+        分别累计成功（success 为 true 或缺省）与失败（success 为 false）
+        交易的金额，``total_count = success_count + failure_count``。
+        无匹配时全部计数为 0、金额为 ``"0"``。当筛选本身指定
+        ``status="success"`` / ``"failure"`` 时，另一状态的计数与金额
+        恒为 0（命不中的状态不会出现在聚合中）。
+        """
+        success_count = 0
+        failure_count = 0
+        success_amount = 0
+        failure_amount = 0
+        for record in self._records:
+            if not _matches(record, filters):
+                continue
+            if record.get("success", True):
+                success_count += 1
+                success_amount += int(record["amount"])
+            else:
+                failure_count += 1
+                failure_amount += int(record["amount"])
+
+        return {
+            "total_count": success_count + failure_count,
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "success_amount": str(success_amount),
+            "failure_amount": str(failure_amount),
         }
 
     def method_stats(self, filters, page_size=DEFAULT_PAGE_SIZE, cursor=None):

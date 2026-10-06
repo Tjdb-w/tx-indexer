@@ -24,6 +24,7 @@ from .errors import (
     InvalidCursorError,
     InvalidFilterError,
     InvalidPageSizeError,
+    InvalidStatusFilterError,
     InvalidTimeRangeError,
     InvalidTransactionError,
     SourceUnavailableError,
