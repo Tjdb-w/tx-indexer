@@ -1,12 +1,14 @@
 """命令行入口：``tx-indexer query`` / ``stats`` / ``method-stats`` /
-``address-stats`` / ``counterparty-stats`` / ``time-stats`` /
-``pair-stats`` / ``address-time-stats`` / ``time-bucket-aggregation``。
+``address-stats`` / ``address-flow-stats`` / ``counterparty-stats`` /
+``time-stats`` / ``pair-stats`` / ``address-time-stats`` /
+``time-bucket-aggregation``。
 
 用法：
     tx-indexer query <data.jsonl> [筛选与分页选项]
     tx-indexer stats <data.jsonl> [筛选选项]
     tx-indexer method-stats <data.jsonl> [筛选与分页选项]
     tx-indexer address-stats <data.jsonl> [筛选与分页选项]
+    tx-indexer address-flow-stats <data.jsonl> [筛选与分页选项]
     tx-indexer counterparty-stats <data.jsonl> --address ADDR [筛选与分页选项]
     tx-indexer time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
     tx-indexer pair-stats <data.jsonl> [筛选与分页选项]
@@ -189,6 +191,24 @@ def build_parser():
         help="每页分组数，1 到 1000，默认 100",
     )
     address_stats_parser.add_argument(
+        "--cursor", help="上一页返回的 next_cursor"
+    )
+
+    address_flow_stats_parser = subparsers.add_parser(
+        "address-flow-stats",
+        help="按地址拆分发送/接收资金流向分页汇总"
+             "（返回 groups/total_groups/next_cursor）",
+    )
+    address_flow_stats_parser.add_argument(
+        "file", help="JSON Lines 数据文件路径"
+    )
+    _add_filter_args(address_flow_stats_parser)
+    address_flow_stats_parser.add_argument(
+        "--page-size",
+        default=str(DEFAULT_PAGE_SIZE),
+        help="每页分组数，1 到 1000，默认 100",
+    )
+    address_flow_stats_parser.add_argument(
         "--cursor", help="上一页返回的 next_cursor"
     )
 
@@ -402,6 +422,7 @@ def main(argv=None):
                 "query",
                 "method-stats",
                 "address-stats",
+                "address-flow-stats",
                 "counterparty-stats",
                 "time-stats",
                 "pair-stats",
@@ -432,6 +453,10 @@ def main(argv=None):
                 )
             elif args.command == "address-stats":
                 result = indexer.address_stats(
+                    filters, page_size=page_size, cursor=args.cursor
+                )
+            elif args.command == "address-flow-stats":
+                result = indexer.address_flow_stats(
                     filters, page_size=page_size, cursor=args.cursor
                 )
             elif args.command == "counterparty-stats":

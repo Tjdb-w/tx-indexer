@@ -24,6 +24,11 @@ time-stats 把匹配交易按从 Unix 纪元对齐、左闭右开的固定宽度
 pair-stats 把匹配交易按 from_address 到 to_address 的原字符串有向
 组合分组（自转账也累计一次），顺序为 total_amount 降序、total_count
 降序、from_address 码点升序、to_address 码点升序。
+address-flow-stats 拆分发送与接收资金流向：每笔匹配交易的 amount 分别
+计入 from_address 的 sent_amount 与 to_address 的 received_amount，
+自转账两方各计一次；net_amount = received_amount - sent_amount（可负），
+顺序为 net_amount 降序、sent_amount 降序、received_amount 降序、
+total_count 降序、address 码点升序。
 address-time-stats 先按从 Unix 纪元对齐、左闭右开的固定宽度时间区间
 分桶，再按参与地址在各区间内聚合（口径与 address-stats 相同），只
 返回非空（区间, 地址）组，顺序为 bucket_start 升序、total_amount
@@ -42,6 +47,7 @@ total_count、success_count、failure_count，游标绑定完整查询条件与
 import bisect
 
 from .cursor import (
+    decode_address_flow_stats_cursor,
     decode_address_stats_cursor,
     decode_address_time_stats_cursor,
     decode_counterparty_stats_cursor,
@@ -50,6 +56,7 @@ from .cursor import (
     decode_pair_stats_cursor,
     decode_time_bucket_aggregation_cursor,
     decode_time_stats_cursor,
+    encode_address_flow_stats_cursor,
     encode_address_stats_cursor,
     encode_address_time_stats_cursor,
     encode_counterparty_stats_cursor,
@@ -617,6 +624,140 @@ class TxIndexer:
                 total_counts[last],
                 send_counts[last],
                 receive_counts[last],
+                last,
+            )
+        else:
+            next_cursor = None
+
+        return {
+            "groups": groups,
+            "total_groups": total_groups,
+            "next_cursor": next_cursor,
+        }
+
+    def address_flow_stats(self, filters, page_size=DEFAULT_PAGE_SIZE,
+                           cursor=None):
+        """按参与地址拆分发送/接收资金流向的分页统计。
+
+        每条匹配交易的 amount 以十进制整数数值分别计入 from_address 的
+        sent_amount 与 to_address 的 received_amount；自转账
+        （from == to）两方各计一次（sent_amount 与 received_amount
+        各加一次 amount），send_count / receive_count 各加一，
+        total_count 只计一次。net_amount = received_amount -
+        sent_amount，可为负。
+
+        返回 {groups, total_groups, next_cursor}；每组含 address、
+        sent_amount、received_amount、net_amount（均为十进制整数字符串，
+        net_amount 可为带负号字符串，零为 ``"0"``）、send_count、
+        receive_count、total_count。顺序：net_amount 降序、sent_amount
+        降序、received_amount 降序、total_count 降序、address 的 Unicode
+        码点升序。游标绑定本命令与等价筛选，不绑定 page_size。
+        """
+        self._validate_page_size(page_size)
+
+        sent_totals = {}
+        received_totals = {}
+        send_counts = {}
+        receive_counts = {}
+        total_counts = {}
+        for record in self._records:
+            if not _matches(record, filters):
+                continue
+            value = int(record["amount"])
+            frm = record["from_address"]
+            to = record["to_address"]
+
+            sent_totals[frm] = sent_totals.get(frm, 0) + value
+            send_counts[frm] = send_counts.get(frm, 0) + 1
+            total_counts[frm] = total_counts.get(frm, 0) + 1
+            receive_counts.setdefault(frm, 0)
+            received_totals.setdefault(frm, 0)
+
+            if to == frm:
+                # 自转账：发送与接收两方各计一次金额与身份计数，
+                # total_count 只计一次
+                received_totals[to] += value
+                receive_counts[to] += 1
+            else:
+                received_totals[to] = received_totals.get(to, 0) + value
+                receive_counts[to] = receive_counts.get(to, 0) + 1
+                total_counts[to] = total_counts.get(to, 0) + 1
+                send_counts.setdefault(to, 0)
+                sent_totals.setdefault(to, 0)
+
+        def _net(address):
+            return received_totals[address] - sent_totals[address]
+
+        # (-net, -sent, -received, -total_count, address) 升序即各数值
+        # 降序、address 升序，同时得到可直接 bisect 的单调递增键
+        addresses = sorted(
+            sent_totals,
+            key=lambda a: (
+                -_net(a),
+                -sent_totals[a],
+                -received_totals[a],
+                -total_counts[a],
+                a,
+            ),
+        )
+        total_groups = len(addresses)
+
+        start = 0
+        if cursor is not None:
+            (
+                after_net,
+                after_sent,
+                after_received,
+                after_total_count,
+                after_address,
+            ) = decode_address_flow_stats_cursor(cursor, filters)
+            keys = [
+                (
+                    -_net(a),
+                    -sent_totals[a],
+                    -received_totals[a],
+                    -total_counts[a],
+                    a,
+                )
+                for a in addresses
+            ]
+            marker = (
+                -after_net,
+                -after_sent,
+                -after_received,
+                -after_total_count,
+                after_address,
+            )
+            # keyset 续页：排序键严格大于 marker 的第一个位置。
+            # marker 位于两键之间也安全（bisect 取下一键），不会跳过或重复。
+            start = bisect.bisect_left(keys, marker)
+            if start < total_groups and keys[start] == marker:
+                # marker 命中现存分组本身：从其后一组开始
+                start += 1
+
+        end = start + page_size
+        page_addresses = addresses[start:end]
+        groups = []
+        for address in page_addresses:
+            sent = sent_totals[address]
+            received = received_totals[address]
+            groups.append({
+                "address": address,
+                "sent_amount": str(sent),
+                "received_amount": str(received),
+                "net_amount": str(received - sent),
+                "send_count": send_counts[address],
+                "receive_count": receive_counts[address],
+                "total_count": total_counts[address],
+            })
+        if end < total_groups:
+            last = page_addresses[-1]
+            next_cursor = encode_address_flow_stats_cursor(
+                filters,
+                received_totals[last] - sent_totals[last],
+                sent_totals[last],
+                received_totals[last],
+                total_counts[last],
                 last,
             )
         else:
