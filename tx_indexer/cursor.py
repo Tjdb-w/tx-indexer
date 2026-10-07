@@ -51,6 +51,8 @@ SCOPE_METHOD_STATS = "method-stats"
 #: 按 method 拆分成功/失败计数与金额的分页统计作用域标识
 SCOPE_METHOD_STATUS_STATS = "method-status-stats"
 SCOPE_ADDRESS_STATS = "address-stats"
+#: 地址 × method 交叉汇总（成功/失败计数拆分）的作用域标识
+SCOPE_ADDRESS_METHOD_STATS = "address-method-stats"
 SCOPE_COUNTERPARTY_STATS = "counterparty-stats"
 SCOPE_TIME_STATS = "time-stats"
 SCOPE_PAIR_STATS = "pair-stats"
@@ -342,6 +344,63 @@ def decode_address_stats_cursor(token, filters):
     receive_count, address)``。
     """
     return _decode_stats_cursor(token, filters, SCOPE_ADDRESS_STATS)
+
+
+def encode_address_method_stats_cursor(filters, after_total_amount,
+                                       after_total_count, after_send_count,
+                                       after_receive_count, after_address,
+                                       after_method):
+    """address-method-stats 游标：绑定命令与等价筛选（含 status、金额与
+    区块数值边界），不绑定 page_size。marker 为上一页最后一组的完整
+    排序键（address、method 为组键）。"""
+    payload = {
+        "v": _CURSOR_VERSION,
+        "c": SCOPE_ADDRESS_METHOD_STATS,
+        "f": _canonical_filters(filters),
+        "after": [
+            after_total_amount,
+            after_total_count,
+            after_send_count,
+            after_receive_count,
+            after_address,
+            after_method,
+        ],
+    }
+    return _encode_payload(payload)
+
+
+def decode_address_method_stats_cursor(token, filters):
+    """解码并校验 address-method-stats 游标。
+
+    返回 exclusive marker ``(total_amount, total_count, send_count,
+    receive_count, address, method)``。
+    """
+    payload = _decode_payload(token, filters, SCOPE_ADDRESS_METHOD_STATS)
+
+    after = payload.get("after")
+    if (
+        not isinstance(after, list)
+        or len(after) != 6
+        or not isinstance(after[0], int)
+        or isinstance(after[0], bool)
+        or after[0] < 0
+        or not isinstance(after[1], int)
+        or isinstance(after[1], bool)
+        or after[1] < 1
+        or not isinstance(after[2], int)
+        or isinstance(after[2], bool)
+        or after[2] < 0
+        or not isinstance(after[3], int)
+        or isinstance(after[3], bool)
+        or after[3] < 0
+        or not isinstance(after[4], str)
+        or after[4] == ""
+        or not isinstance(after[5], str)
+        or after[5] == ""
+    ):
+        raise InvalidCursorError("游标位置信息非法", None)
+
+    return after[0], after[1], after[2], after[3], after[4], after[5]
 
 
 def encode_counterparty_stats_cursor(filters, after_total_amount,

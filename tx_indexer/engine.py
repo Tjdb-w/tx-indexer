@@ -23,6 +23,12 @@ method-status-stats 在 method-stats 基础上拆分成功/失败计数与金额
 failure_count 降序、method 码点升序。
 address-stats 排序：total_amount 降序、total_count 降序、send_count 降序、
 receive_count 降序、address 码点升序。
+address-method-stats 把每条匹配交易的发送方与接收方按各自 method 原字符串
+交叉分组（同一地址不同 method 归不同组；自转账只进一个组，total_count、
+total_amount 与成功/失败计数各计一次，send_count / receive_count 各加一），
+每组还返回 success_count、failure_count，排序为 total_amount 降序、
+total_count 降序、send_count 降序、receive_count 降序、address 码点升序、
+method 码点升序。
 counterparty-stats 排序键与 address-stats 相同，末级改为 counterparty
 码点升序；每笔匹配交易只归入一个对手（发送方为观察地址时归
 to_address，接收方为观察地址时归 from_address，自转账归观察地址本身）。
@@ -61,6 +67,7 @@ import bisect
 
 from .cursor import (
     decode_address_flow_stats_cursor,
+    decode_address_method_stats_cursor,
     decode_address_stats_cursor,
     decode_address_time_stats_cursor,
     decode_counterparty_stats_cursor,
@@ -72,6 +79,7 @@ from .cursor import (
     decode_time_bucket_aggregation_cursor,
     decode_time_stats_cursor,
     encode_address_flow_stats_cursor,
+    encode_address_method_stats_cursor,
     encode_address_stats_cursor,
     encode_address_time_stats_cursor,
     encode_counterparty_stats_cursor,
@@ -824,6 +832,169 @@ class TxIndexer:
                 send_counts[last],
                 receive_counts[last],
                 last,
+            )
+        else:
+            next_cursor = None
+
+        return {
+            "groups": groups,
+            "total_groups": total_groups,
+            "next_cursor": next_cursor,
+        }
+
+    def address_method_stats(self, filters, page_size=DEFAULT_PAGE_SIZE,
+                             cursor=None):
+        """按参与地址 × method 交叉分组的分页统计。
+
+        每条匹配交易以其 method 原字符串为限定：from_address 作为发送方
+        计入 ``(from_address, method)`` 组的 send_count，to_address 作为
+        接收方计入 ``(to_address, method)`` 组的 receive_count；同一地址
+        以不同 method 收发归入不同组。自转账（from == to）只进一个组：
+        total_count、total_amount 与成功/失败计数各只计一次，
+        send_count / receive_count 各加一。
+
+        返回 {groups, total_groups, next_cursor}；每组含 address、method、
+        send_count、receive_count、total_count、total_amount、
+        success_count、failure_count、avg_amount（金额为无前导零十进制
+        整数字符串，``avg_amount = total_amount // total_count`` 向下
+        取整，``total_count = success_count + failure_count``）。记录未
+        携带 success（如回放标准化记录）时按成功处理；指定
+        ``status=success`` / ``failure`` 时，另一状态的计数恒为 0。
+        顺序：total_amount 降序、total_count 降序、send_count 降序、
+        receive_count 降序、address 的 Unicode 码点升序、method 的
+        Unicode 码点升序。游标绑定本命令与等价筛选（含 status、金额与
+        区块数值边界），不绑定 page_size。
+        """
+        self._validate_page_size(page_size)
+
+        # key = (address, method)
+        totals = {}
+        send_counts = {}
+        receive_counts = {}
+        total_counts = {}
+        success_counts = {}
+        failure_counts = {}
+        for record in self._records:
+            if not _matches(record, filters):
+                continue
+            value = int(record["amount"])
+            frm = record["from_address"]
+            to = record["to_address"]
+            method = record["method"]
+            succeeded = record.get("success", True)
+
+            sender_key = (frm, method)
+            totals[sender_key] = totals.get(sender_key, 0) + value
+            send_counts[sender_key] = send_counts.get(sender_key, 0) + 1
+            total_counts[sender_key] = total_counts.get(sender_key, 0) + 1
+            receive_counts.setdefault(sender_key, 0)
+            success_counts.setdefault(sender_key, 0)
+            failure_counts.setdefault(sender_key, 0)
+            if succeeded:
+                success_counts[sender_key] += 1
+            else:
+                failure_counts[sender_key] += 1
+
+            if to == frm:
+                # 自转账：total_count、金额与成功/失败计数不重复累计，
+                # 但发送、接收两个身份各加一
+                receive_counts[sender_key] += 1
+            else:
+                receiver_key = (to, method)
+                totals[receiver_key] = totals.get(receiver_key, 0) + value
+                receive_counts[receiver_key] = (
+                    receive_counts.get(receiver_key, 0) + 1
+                )
+                total_counts[receiver_key] = (
+                    total_counts.get(receiver_key, 0) + 1
+                )
+                send_counts.setdefault(receiver_key, 0)
+                success_counts.setdefault(receiver_key, 0)
+                failure_counts.setdefault(receiver_key, 0)
+                if succeeded:
+                    success_counts[receiver_key] += 1
+                else:
+                    failure_counts[receiver_key] += 1
+
+        # (-total, -total_count, -send, -receive, address, method) 升序即
+        # 各数值降序、address/method 升序，同时得到可直接 bisect 的单调
+        # 递增键
+        group_keys = sorted(
+            totals,
+            key=lambda k: (
+                -totals[k],
+                -total_counts[k],
+                -send_counts[k],
+                -receive_counts[k],
+                k[0],
+                k[1],
+            ),
+        )
+        total_groups = len(group_keys)
+
+        start = 0
+        if cursor is not None:
+            (
+                after_total,
+                after_total_count,
+                after_send,
+                after_receive,
+                after_address,
+                after_method,
+            ) = decode_address_method_stats_cursor(cursor, filters)
+            keys = [
+                (
+                    -totals[k],
+                    -total_counts[k],
+                    -send_counts[k],
+                    -receive_counts[k],
+                    k[0],
+                    k[1],
+                )
+                for k in group_keys
+            ]
+            marker = (
+                -after_total,
+                -after_total_count,
+                -after_send,
+                -after_receive,
+                after_address,
+                after_method,
+            )
+            # keyset 续页：排序键严格大于 marker 的第一个位置。
+            # marker 位于两键之间也安全（bisect 取下一键），不会跳过或重复。
+            start = bisect.bisect_left(keys, marker)
+            if start < total_groups and keys[start] == marker:
+                # marker 命中现存分组本身：从其后一组开始
+                start += 1
+
+        end = start + page_size
+        page_keys = group_keys[start:end]
+        groups = []
+        for address, method in page_keys:
+            total_amount = totals[(address, method)]
+            total_count = total_counts[(address, method)]
+            groups.append({
+                "address": address,
+                "method": method,
+                "send_count": send_counts[(address, method)],
+                "receive_count": receive_counts[(address, method)],
+                "total_count": total_count,
+                "total_amount": str(total_amount),
+                "success_count": success_counts[(address, method)],
+                "failure_count": failure_counts[(address, method)],
+                "avg_amount": str(total_amount // total_count),
+            })
+        if end < total_groups:
+            last_address, last_method = page_keys[-1]
+            next_cursor = encode_address_method_stats_cursor(
+                filters,
+                totals[page_keys[-1]],
+                total_counts[page_keys[-1]],
+                send_counts[page_keys[-1]],
+                receive_counts[page_keys[-1]],
+                last_address,
+                last_method,
             )
         else:
             next_cursor = None
