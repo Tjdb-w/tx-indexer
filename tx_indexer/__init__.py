@@ -24,6 +24,8 @@ from .errors import (
     InvalidCursorError,
     InvalidFilterError,
     InvalidPageSizeError,
+    InvalidSeriesCursorError,
+    InvalidSeriesRangeError,
     InvalidStatusFilterError,
     InvalidTimeRangeError,
     InvalidTransactionError,
@@ -31,6 +33,7 @@ from .errors import (
     TransactionConflictError,
     UnsupportedAggregationBucket,
     UnsupportedAggregationBucketError,
+    UnsupportedSeriesBucketError,
 )
 from .importer import (
     BLOCK_CONFLICT,
@@ -62,6 +65,8 @@ __all__ = [
     "InvalidCursorError",
     "InvalidFilterError",
     "InvalidPageSizeError",
+    "InvalidSeriesCursorError",
+    "InvalidSeriesRangeError",
     "InvalidStatusFilterError",
     "InvalidTimeRangeError",
     "InvalidTransactionError",
@@ -72,4 +77,5 @@ __all__ = [
     "TransactionConflictError",
     "UnsupportedAggregationBucket",
     "UnsupportedAggregationBucketError",
+    "UnsupportedSeriesBucketError",
 ]

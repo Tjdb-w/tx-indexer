@@ -135,6 +135,26 @@ class InvalidAggregationCursor(TxIndexerError):
     error = "invalid_aggregation_cursor"
 
 
+class InvalidSeriesRangeError(TxIndexerError):
+    """method-time-series 的时间范围非法：start_time/end_time 缺失、
+    类型非法、为负或 end_time 不大于 start_time。"""
+
+    error = "invalid_series_range"
+
+
+class UnsupportedSeriesBucketError(TxIndexerError):
+    """method-time-series 的桶粒度缺失、类型非法或不是 hour/day。"""
+
+    error = "unsupported_series_bucket"
+
+
+class InvalidSeriesCursorError(TxIndexerError):
+    """method-time-series 游标格式错误、被篡改、无法解码、复用其他命令
+    游标，或与当前筛选/时间窗/桶粒度不一致。"""
+
+    error = "invalid_series_cursor"
+
+
 # 错误类型后缀别名：与既有异常命名（…Error）保持一致，两种写法等价
 InvalidAggregationRangeError = InvalidAggregationRange
 UnsupportedAggregationBucketError = UnsupportedAggregationBucket

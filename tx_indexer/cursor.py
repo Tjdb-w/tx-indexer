@@ -29,6 +29,12 @@ status 字段的旧游标只在本次未指定状态时可续翻。
 完整查询条件（address、method、起止时间）与桶粒度（hour/day），
 解码失败或条件不一致抛 InvalidAggregationCursor，与其余分页游标
 （InvalidCursorError）相互独立、不能跨命令复用。
+
+method 时间序列游标（scope ``method-time-series``）绑定等价筛选
+（含 status、金额与区块数值边界）、起止时间窗与桶粒度（hour/day），
+marker 为上一页最后一点的 ``(bucket_start, method)``；解码失败、
+篡改、跨命令复用或条件不一致抛 InvalidSeriesCursorError，与其余
+分页游标相互独立、不能跨命令复用。
 """
 
 import base64
@@ -38,6 +44,7 @@ import json
 from .errors import (
     InvalidAggregationCursor,
     InvalidCursorError,
+    InvalidSeriesCursorError,
 )
 from .loader import _AMOUNT_RE
 
@@ -63,6 +70,8 @@ SCOPE_METHOD_TIME_STATS = "method-time-stats"
 SCOPE_ADDRESS_FLOW_STATS = "address-flow-stats"
 #: 时间分桶聚合（连续 hour/day 桶、含空桶）的作用域标识
 SCOPE_TIME_BUCKET_AGGREGATION = "time-bucket-aggregation"
+#: method 时间序列（连续 hour/day 桶 × method、含空桶）的作用域标识
+SCOPE_METHOD_TIME_SERIES = "method-time-series"
 #: 增量导入游标的作用域标识（与所有分页游标相互独立，不能混用）
 SCOPE_IMPORT = "import"
 
@@ -905,3 +914,104 @@ def decode_time_bucket_aggregation_cursor(token, filters, granularity):
         # 时间分桶聚合对外统一使用独立的聚合游标错误类型，不复用
         # invalid_cursor，避免与既有命令的错误语义混淆
         raise InvalidAggregationCursor(exc.message, None) from exc
+
+
+def encode_method_time_series_cursor(filters, start_time, end_time, bucket,
+                                     after_bucket_start, after_method):
+    """method-time-series 游标：绑定等价筛选、时间窗、桶粒度与上一页最后
+    一点的排序键 ``(bucket_start, method)``。
+
+    不绑定 page_size；payload 自包含、base64url 不透明。
+    """
+    payload = {
+        "v": _CURSOR_VERSION,
+        "c": SCOPE_METHOD_TIME_SERIES,
+        "f": _canonical_filters(filters),
+        "w": [start_time, end_time],
+        "g": bucket,
+        "after": [after_bucket_start, after_method],
+    }
+    return _encode_payload(payload)
+
+
+def decode_method_time_series_cursor(token, filters, start_time, end_time,
+                                     bucket):
+    """解码并校验 method-time-series 游标。
+
+    返回 exclusive marker ``(bucket_start, method)``。游标格式错误、被
+    篡改、无法解码、作用域不符（跨命令复用）、筛选/时间窗/桶粒度与当前
+    请求不一致，或 marker 不是范围内合法桶起点时，都抛
+    InvalidSeriesCursorError，绝不返回部分分页数据。
+    """
+    try:
+        if not isinstance(token, str) or token == "":
+            raise InvalidCursorError("游标为空或类型非法", None)
+
+        raw = _b64url_decode(token)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise InvalidCursorError("游标内容非法", None) from exc
+
+        if not isinstance(payload, dict) or payload.get("v") != _CURSOR_VERSION:
+            raise InvalidCursorError("游标版本不受支持", None)
+
+        if payload.get("c") != SCOPE_METHOD_TIME_SERIES:
+            raise InvalidCursorError("游标不属于当前命令", None)
+
+        saved_granularity = payload.get("g")
+        if saved_granularity not in AGGREGATION_GRANULARITIES:
+            raise InvalidCursorError("游标桶粒度非法", None)
+        if saved_granularity != bucket:
+            raise InvalidCursorError("游标与当前桶粒度不匹配", None)
+
+        saved_window = payload.get("w")
+        if (
+            not isinstance(saved_window, list)
+            or len(saved_window) != 2
+            or saved_window != [start_time, end_time]
+        ):
+            raise InvalidCursorError("游标与当前时间窗不匹配", None)
+
+        saved = payload.get("f")
+        if not isinstance(saved, dict):
+            raise InvalidCursorError("游标缺少筛选信息", None)
+
+        try:
+            saved_canonical = _canonical_filters(saved)
+            current_canonical = _canonical_filters(filters)
+        except (TypeError, ValueError) as exc:
+            raise InvalidCursorError("游标筛选信息非法", None) from exc
+        if saved_canonical != current_canonical:
+            raise InvalidCursorError("游标与当前筛选条件不匹配", None)
+
+        after = payload.get("after")
+        if (
+            not isinstance(after, list)
+            or len(after) != 2
+            or not isinstance(after[0], int)
+            or isinstance(after[0], bool)
+            or after[0] < 0
+            or not isinstance(after[1], str)
+            or after[1] == ""
+        ):
+            raise InvalidCursorError("游标位置信息非法", None)
+
+        width = AGGREGATION_GRANULARITIES[saved_granularity]
+        # marker 的 bucket_start 必须是查询范围内一个实际返回桶的起点：
+        # 桶按纪元整点/整日对齐，首桶可早于 start_time、末桶只覆盖
+        # end_time 之前的数据。任何越界或错位的篡改值都在此被拒绝。
+        first_start = (start_time // width) * width
+        last_start = ((end_time - 1) // width) * width
+        if (
+            after[0] % width != 0
+            or after[0] < first_start
+            or after[0] > last_start
+        ):
+            raise InvalidCursorError("游标位置不在合法桶边界上", None)
+
+        return after[0], after[1]
+    except InvalidCursorError as exc:
+        # method-time-series 对外统一使用独立的序列游标错误类型，不复用
+        # invalid_cursor，避免与既有命令的错误语义混淆
+        raise InvalidSeriesCursorError(exc.message, None) from exc

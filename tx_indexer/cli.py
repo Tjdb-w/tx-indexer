@@ -3,7 +3,7 @@
 ``address-stats`` / ``address-method-stats`` /
 ``address-flow-stats`` / ``counterparty-stats`` /
 ``time-stats`` / ``pair-stats`` / ``address-time-stats`` /
-``time-bucket-aggregation``。
+``time-bucket-aggregation`` / ``method-time-series``。
 
 用法：
     tx-indexer query <data.jsonl> [筛选与分页选项]
@@ -20,6 +20,7 @@
     tx-indexer address-time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
     tx-indexer method-time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
     tx-indexer time-bucket-aggregation <data.jsonl> --start-time TS --end-time TS --bucket hour|day [选项]
+    tx-indexer method-time-series <data.jsonl> --start-time TS --end-time TS --bucket hour|day [筛选与分页选项]
 
 领域错误（invalid_transaction / duplicate_transaction / invalid_time_range /
 invalid_page_size / invalid_cursor / invalid_filter / invalid_status_filter /
@@ -27,7 +28,8 @@ invalid_bucket_size /
 invalid_amount_filter / invalid_amount_range / invalid_block_filter /
 invalid_block_range / invalid_aggregation_range /
 unsupported_aggregation_bucket / invalid_aggregation_filter /
-invalid_aggregation_cursor）
+invalid_aggregation_cursor / invalid_series_range /
+unsupported_series_bucket / invalid_series_cursor）
 以 JSON 对象输出到 stderr，退出码 2：
 
     {"error": "...", "message": "...", "input_line": 12}
@@ -41,6 +43,7 @@ from .engine import (
     DEFAULT_PAGE_SIZE,
     TxIndexer,
     normalize_filters,
+    validate_method_time_series_params,
     validate_time_bucket_aggregation_params,
 )
 from .errors import (
@@ -50,8 +53,10 @@ from .errors import (
     InvalidBucketSizeError,
     InvalidFilterError,
     InvalidPageSizeError,
+    InvalidSeriesRangeError,
     TxIndexerError,
     UnsupportedAggregationBucket,
+    UnsupportedSeriesBucketError,
 )
 from .loader import _AMOUNT_RE, load_file
 
@@ -401,6 +406,27 @@ def build_parser():
         "--cursor", help="上一页返回的 next_cursor"
     )
 
+    series_parser = subparsers.add_parser(
+        "method-time-series",
+        help="按 hour/day 连续桶 × method 的时间序列"
+             "（返回 series/total_points/total_methods/total_buckets/"
+             "next_cursor，含空桶）",
+    )
+    series_parser.add_argument("file", help="JSON Lines 数据文件路径")
+    _add_filter_args(series_parser)
+    series_parser.add_argument(
+        "--bucket",
+        help="桶粒度：hour（整点小时）或 day（UTC 自然日）；必填",
+    )
+    series_parser.add_argument(
+        "--page-size",
+        default=str(DEFAULT_PAGE_SIZE),
+        help="每页点数，1 到 1000，默认 100",
+    )
+    series_parser.add_argument(
+        "--cursor", help="上一页返回的 next_cursor"
+    )
+
     return parser
 
 
@@ -493,6 +519,68 @@ def main(argv=None):
                 args.bucket,
                 address=args.address,
                 method=agg_method,
+                page_size=page_size,
+                cursor=args.cursor,
+            )
+        elif args.command == "method-time-series":
+            # 独立的 method 时间序列入口：沿用 query 的通用筛选，另加必填
+            # 的左闭右开时间窗与 hour/day 桶粒度。范围、桶粒度与筛选值的
+            # 校验全部在读取数据文件前完成。
+            if args.start_time is None or args.end_time is None:
+                raise InvalidSeriesRangeError(
+                    "method-time-series 必须指定 --start-time 与"
+                    " --end-time（UTC 秒，左闭右开）",
+                    None,
+                )
+            try:
+                series_start = int(args.start_time)
+                series_end = int(args.end_time)
+            except (TypeError, ValueError):
+                raise InvalidSeriesRangeError(
+                    "--start-time 与 --end-time 必须为非负 UTC 秒整数",
+                    None,
+                )
+            if args.bucket is None:
+                raise UnsupportedSeriesBucketError(
+                    "method-time-series 必须指定 --bucket hour|day",
+                    None,
+                )
+            # 范围为负/倒置、非法桶粒度均在此抛出对应序列错误
+            validate_method_time_series_params(
+                series_start, series_end, args.bucket
+            )
+            # 通用筛选沿用 query 语义（本命令的 --start-time/--end-time
+            # 是左闭右开的序列窗口，不进入筛选字典）
+            min_block = (
+                _parse_block_bound(args.min_block, "--min-block")
+                if args.min_block is not None
+                else None
+            )
+            max_block = (
+                _parse_block_bound(args.max_block, "--max-block")
+                if args.max_block is not None
+                else None
+            )
+            filters = normalize_filters(
+                address=args.address,
+                method=args.method,
+                from_address=args.from_address,
+                to_address=args.to_address,
+                min_amount=args.min_amount,
+                max_amount=args.max_amount,
+                min_block=min_block,
+                max_block=max_block,
+                status=args.status,
+            )
+            page_size = _parse_page_size(args.page_size)
+
+            records = load_file(args.file)
+            indexer = TxIndexer(records)
+            result = indexer.method_time_series(
+                filters,
+                series_start,
+                series_end,
+                args.bucket,
                 page_size=page_size,
                 cursor=args.cursor,
             )
