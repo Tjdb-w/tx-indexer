@@ -65,6 +65,14 @@ method-time-series 在同样的左闭右开必填时间窗与 hour/day 桶粒度
 success_count、failure_count，按 bucket_start 升序、同桶 method
 码点升序分页；游标绑定等价筛选、时间窗与桶粒度，错误使用独立的
 InvalidSeries*Error 异常类型。
+address-flow-time-series 在同样的左闭右开必填时间窗与 hour/day 桶
+粒度下，沿用 query 的全部筛选并要求必填观察地址 address（不可与
+from_address / to_address 并用），按桶统计该地址的资金流向：发送、
+接收分别累计，自转账两侧累计但 total_count 只计一次，每点含
+bucket_start、sent_count、received_count、total_count、
+sent_amount、received_amount、net_amount，按 bucket_start 升序返回
+范围内全部连续桶（空桶零填充）；游标绑定等价筛选、时间窗与桶粒度，
+错误使用独立的 InvalidFlowSeries* 异常类型。
 分页：不透明 keyset 游标（见 :mod:`tx_indexer.cursor`），相同命令与
 筛选下不跳过、不重复、不乱序；``total`` / ``total_groups`` 始终为
 全部匹配数 / 全部分组数。
@@ -74,6 +82,7 @@ import bisect
 
 from .cursor import (
     decode_address_flow_stats_cursor,
+    decode_address_flow_time_series_cursor,
     decode_address_method_stats_cursor,
     decode_address_stats_cursor,
     decode_address_time_stats_cursor,
@@ -87,6 +96,7 @@ from .cursor import (
     decode_time_bucket_aggregation_cursor,
     decode_time_stats_cursor,
     encode_address_flow_stats_cursor,
+    encode_address_flow_time_series_cursor,
     encode_address_method_stats_cursor,
     encode_address_stats_cursor,
     encode_address_time_stats_cursor,
@@ -109,11 +119,14 @@ from .errors import (
     InvalidBlockRangeError,
     InvalidBucketSizeError,
     InvalidFilterError,
+    InvalidFlowSeriesFilter,
+    InvalidFlowSeriesRange,
     InvalidPageSizeError,
     InvalidSeriesRangeError,
     InvalidStatusFilterError,
     InvalidTimeRangeError,
     UnsupportedAggregationBucket,
+    UnsupportedFlowSeriesBucket,
     UnsupportedSeriesBucketError,
 )
 from .loader import _AMOUNT_RE
@@ -429,6 +442,55 @@ def validate_method_time_series_params(start_time, end_time, bucket):
             % (bucket,),
             None,
         )
+    return _AGGREGATION_GRANULARITY_SECONDS[bucket]
+
+
+def validate_address_flow_time_series_params(filters, start_time, end_time,
+                                             bucket):
+    """address-flow-time-series 的时间窗、桶粒度与观察地址校验（不依赖
+    数据，可在读取数据文件前执行）。
+
+    返回桶宽（UTC 秒）。时间范围缺失、类型非法、为负或
+    ``end_time <= start_time`` 抛 InvalidFlowSeriesRange；桶粒度缺失、
+    类型非法或不是 hour/day 抛 UnsupportedFlowSeriesBucket；筛选缺少
+    观察地址 address 抛 InvalidFlowSeriesFilter。其余筛选值沿用 query
+    语义，由 normalize_filters 先行归一化（address 与 from_address /
+    to_address 的并用冲突同样在归一化时报 InvalidFilterError）。
+    """
+    # 1. 时间范围：必填、非负 UTC 秒整数、左闭右开且非空
+    if (
+        not isinstance(start_time, int)
+        or isinstance(start_time, bool)
+        or not isinstance(end_time, int)
+        or isinstance(end_time, bool)
+        or start_time < 0
+        or end_time < 0
+        or end_time <= start_time
+    ):
+        raise InvalidFlowSeriesRange(
+            "address-flow-time-series 要求 start_time、end_time 为非负"
+            " UTC 秒整数，且 end_time 严格大于 start_time（左闭右开）",
+            None,
+        )
+
+    # 2. 桶粒度：只支持小时与 UTC 自然日
+    if not isinstance(bucket, str) or (
+        bucket not in _AGGREGATION_GRANULARITY_SECONDS
+    ):
+        raise UnsupportedFlowSeriesBucket(
+            "address-flow-time-series 的桶粒度必须是 hour 或 day，收到：%r"
+            % (bucket,),
+            None,
+        )
+
+    # 3. 观察地址：必填的非空字符串（normalize_filters 已拒绝空白值与
+    # address/from/to 并用，此处兜底缺失场景）
+    address = filters.get("address") if isinstance(filters, dict) else None
+    if not isinstance(address, str) or address == "":
+        raise InvalidFlowSeriesFilter(
+            "address-flow-time-series 必须指定非空观察地址 address", None
+        )
+
     return _AGGREGATION_GRANULARITY_SECONDS[bucket]
 
 
@@ -2026,6 +2088,140 @@ class TxIndexer:
             "series": series,
             "total_points": total_points,
             "total_methods": total_methods,
+            "total_buckets": total_buckets,
+            "next_cursor": next_cursor,
+        }
+
+    def address_flow_time_series(self, filters, start_time, end_time, bucket,
+                                 page_size=DEFAULT_PAGE_SIZE, cursor=None):
+        """按 hour/day 连续分桶观察指定地址资金流向的时间序列分页统计。
+
+        沿用 query 的全部筛选（``filters`` 由 :func:`normalize_filters`
+        构造，各条件取交集），并要求必填的观察地址
+        ``filters["address"]``（不可与 from_address / to_address 并用，
+        缺失抛 InvalidFlowSeriesFilter）。在此之上叠加必填的左闭右开
+        时间窗 ``[start_time, end_time)``（UTC 秒）与必填桶粒度
+        ``bucket``（``"hour"`` 按整点、``"day"`` 按 UTC 自然日，桶宽
+        3600/86400 秒、从 Unix 纪元对齐）。窗内命中交易按纪元对齐到
+        **全部连续桶**——首桶按纪元对齐（可早于 start_time），末桶只
+        覆盖 end_time 之前的数据，无交易的桶同样返回、所有计数与金额
+        均为零值，不静默跳过。
+
+        口径（相对观察地址）：该地址作为发送方时 sent_count 加一、
+        sent_amount 累计 amount；作为接收方时 received_count 加一、
+        received_amount 累计 amount；自转账两侧分别累计，但
+        total_count 只计一次。net_amount = received_amount -
+        sent_amount，可为负（带负号十进制字符串，零为 ``"0"``）。
+
+        返回 ``{series, total_points, total_buckets, next_cursor}``：
+        ``series`` 每项含 ``bucket_start``、``sent_count``、
+        ``received_count``、``total_count``、``sent_amount``、
+        ``received_amount``（金额为无前导零十进制字符串）、
+        ``net_amount``，按 ``bucket_start`` 升序；``total_points`` 即
+        连续桶总数 ``total_buckets``（均为全部结果数而非当前页数），
+        无命中交易时返回等长的零值序列。
+
+        确定性错误（均在返回任何分页数据之前抛出）：
+
+        - 缺少观察地址 address → InvalidFlowSeriesFilter
+        - 起止时间缺失、类型非法、为负或 ``end_time <= start_time`` →
+          InvalidFlowSeriesRange
+        - 桶粒度缺失、类型非法或不是 hour/day →
+          UnsupportedFlowSeriesBucket
+        - page_size 非法 → InvalidPageSizeError
+        - 游标格式错误、被篡改、跨命令复用，或筛选、时间窗、桶粒度与
+          签发时不一致 → InvalidFlowSeriesCursor
+
+        游标绑定等价筛选（含观察地址、status、金额与区块数值边界）、
+        时间窗与桶粒度，不绑定 page_size；相同条件下翻页不重复、不
+        遗漏。末页之后再翻页返回空 ``series`` 与
+        ``next_cursor=None``。
+        """
+        width = validate_address_flow_time_series_params(
+            filters, start_time, end_time, bucket
+        )
+        self._validate_page_size(page_size)
+        address = filters["address"]
+
+        # 连续桶边界：首桶按纪元整点/整日对齐（可早于 start_time），
+        # 末桶为覆盖 end_time - 1 的那个桶
+        first_start = (start_time // width) * width
+        last_start = ((end_time - 1) // width) * width
+        total_buckets = (last_start - first_start) // width + 1
+
+        # key = bucket_start，值 = [sent_count, received_count,
+        # total_count, sent_amount, received_amount]
+        stats = {}
+        for record in self._records:
+            ts = record["timestamp"]
+            if ts < start_time or ts >= end_time:
+                continue
+            if not _matches(record, filters):
+                continue
+            bucket_start = (ts // width) * width
+            slot = stats.get(bucket_start)
+            if slot is None:
+                slot = [0, 0, 0, 0, 0]
+                stats[bucket_start] = slot
+            value = int(record["amount"])
+            is_sent = record["from_address"] == address
+            is_received = record["to_address"] == address
+            if is_sent:
+                slot[0] += 1
+                slot[3] += value
+            if is_received:
+                slot[1] += 1
+                slot[4] += value
+            # 每笔命中交易 total_count 只计一次；自转账时发送、接收两个
+            # 身份在上文两侧各计一次，但计数不重复（筛选保证命中交易必
+            # 涉及观察地址）
+            slot[2] += 1
+
+        # 游标解码（绑定等价筛选、时间窗与桶粒度）：keyset 续页，
+        # marker 为上一页最后一点的 bucket_start，严格从下一桶开始
+        if cursor is not None:
+            after_bucket_start = decode_address_flow_time_series_cursor(
+                cursor, filters, start_time, end_time, bucket
+            )
+            start_index = (
+                after_bucket_start - first_start
+            ) // width + 1
+        else:
+            start_index = 0
+
+        end_index = start_index + page_size
+        page_end = min(end_index, total_buckets)
+        series = []
+        for index in range(start_index, page_end):
+            bucket_start = first_start + index * width
+            (
+                sent_count,
+                received_count,
+                total_count,
+                sent_amount,
+                received_amount,
+            ) = stats.get(bucket_start, (0, 0, 0, 0, 0))
+            series.append({
+                "bucket_start": bucket_start,
+                "sent_count": sent_count,
+                "received_count": received_count,
+                "total_count": total_count,
+                "sent_amount": str(sent_amount),
+                "received_amount": str(received_amount),
+                "net_amount": str(received_amount - sent_amount),
+            })
+
+        if end_index < total_buckets:
+            marker_start = first_start + (page_end - 1) * width
+            next_cursor = encode_address_flow_time_series_cursor(
+                filters, start_time, end_time, bucket, marker_start
+            )
+        else:
+            next_cursor = None
+
+        return {
+            "series": series,
+            "total_points": total_buckets,
             "total_buckets": total_buckets,
             "next_cursor": next_cursor,
         }

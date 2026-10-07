@@ -3,7 +3,8 @@
 ``address-stats`` / ``address-method-stats`` /
 ``address-flow-stats`` / ``counterparty-stats`` /
 ``time-stats`` / ``pair-stats`` / ``address-time-stats`` /
-``time-bucket-aggregation`` / ``method-time-series``。
+``time-bucket-aggregation`` / ``method-time-series`` /
+``address-flow-time-series``。
 
 用法：
     tx-indexer query <data.jsonl> [筛选与分页选项]
@@ -21,6 +22,7 @@
     tx-indexer method-time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
     tx-indexer time-bucket-aggregation <data.jsonl> --start-time TS --end-time TS --bucket hour|day [选项]
     tx-indexer method-time-series <data.jsonl> --start-time TS --end-time TS --bucket hour|day [筛选与分页选项]
+    tx-indexer address-flow-time-series <data.jsonl> --address ADDR --start-time TS --end-time TS --bucket hour|day [其余筛选与分页选项]
 
 领域错误（invalid_transaction / duplicate_transaction / invalid_time_range /
 invalid_page_size / invalid_cursor / invalid_filter / invalid_status_filter /
@@ -29,7 +31,9 @@ invalid_amount_filter / invalid_amount_range / invalid_block_filter /
 invalid_block_range / invalid_aggregation_range /
 unsupported_aggregation_bucket / invalid_aggregation_filter /
 invalid_aggregation_cursor / invalid_series_range /
-unsupported_series_bucket / invalid_series_cursor）
+unsupported_series_bucket / invalid_series_cursor /
+invalid_flow_series_filter / invalid_flow_series_range /
+unsupported_flow_series_bucket / invalid_flow_series_cursor）
 以 JSON 对象输出到 stderr，退出码 2：
 
     {"error": "...", "message": "...", "input_line": 12}
@@ -43,6 +47,7 @@ from .engine import (
     DEFAULT_PAGE_SIZE,
     TxIndexer,
     normalize_filters,
+    validate_address_flow_time_series_params,
     validate_method_time_series_params,
     validate_time_bucket_aggregation_params,
 )
@@ -52,10 +57,13 @@ from .errors import (
     InvalidBlockFilterError,
     InvalidBucketSizeError,
     InvalidFilterError,
+    InvalidFlowSeriesFilter,
+    InvalidFlowSeriesRange,
     InvalidPageSizeError,
     InvalidSeriesRangeError,
     TxIndexerError,
     UnsupportedAggregationBucket,
+    UnsupportedFlowSeriesBucket,
     UnsupportedSeriesBucketError,
 )
 from .loader import _AMOUNT_RE, load_file
@@ -438,6 +446,43 @@ def build_parser():
         "--cursor", help="上一页返回的 next_cursor"
     )
 
+    address_flow_time_series_parser = subparsers.add_parser(
+        "address-flow-time-series",
+        help="按 hour/day 连续分桶观察指定地址的资金流向时间序列"
+             "（返回 series/total_points/total_buckets，含空桶）",
+    )
+    address_flow_time_series_parser.add_argument(
+        "file", help="JSON Lines 数据文件路径"
+    )
+    _add_filter_args(address_flow_time_series_parser)
+    # --address 为本命令的必填观察地址（不可与 --from-address/--to-address
+    # 并用）；--start-time/--end-time 是必填的左闭右开序列时间窗，
+    # 不作为通用筛选的左闭右闭时间窗解析
+    for action in address_flow_time_series_parser._actions:
+        if action.dest == "address":
+            action.help = (
+                "观察地址（必填）：精确匹配发送方或接收方，"
+                "不可与 --from-address/--to-address 并用"
+            )
+        elif action.dest == "start_time":
+            action.help = "序列时间窗起点（UTC 秒，含）；必填，非负整数"
+        elif action.dest == "end_time":
+            action.help = (
+                "序列时间窗终点（UTC 秒，不含）；必填，非负整数且晚于起点"
+            )
+    address_flow_time_series_parser.add_argument(
+        "--bucket",
+        help="桶粒度：hour（整点小时）或 day（UTC 自然日）；必填",
+    )
+    address_flow_time_series_parser.add_argument(
+        "--page-size",
+        default=str(DEFAULT_PAGE_SIZE),
+        help="每页序列点数，1 到 1000，默认 100",
+    )
+    address_flow_time_series_parser.add_argument(
+        "--cursor", help="上一页返回的 next_cursor"
+    )
+
     return parser
 
 
@@ -571,6 +616,55 @@ def main(argv=None):
                 filters,
                 series_start,
                 series_end,
+                args.bucket,
+                page_size=page_size,
+                cursor=args.cursor,
+            )
+        elif args.command == "address-flow-time-series":
+            # 指定地址资金流向的时间序列入口：沿用 query 的全部筛选
+            # （左闭右开的必填序列时间窗除外，通用筛选时间窗不参与本
+            # 命令），但 --address 为必填观察地址。范围、桶粒度、观察
+            # 地址与筛选值的校验全部在读取数据文件前完成。
+            if args.start_time is None or args.end_time is None:
+                raise InvalidFlowSeriesRange(
+                    "address-flow-time-series 必须指定 --start-time 与"
+                    " --end-time（UTC 秒，左闭右开）",
+                    None,
+                )
+            try:
+                flow_start = int(args.start_time)
+                flow_end = int(args.end_time)
+            except (TypeError, ValueError):
+                raise InvalidFlowSeriesRange(
+                    "--start-time 与 --end-time 必须为非负 UTC 秒整数",
+                    None,
+                )
+            if args.bucket is None:
+                raise UnsupportedFlowSeriesBucket(
+                    "address-flow-time-series 必须指定 --bucket hour|day",
+                    None,
+                )
+            # 通用筛选沿用 query 语义与既有错误（空白、address/from/to
+            # 冲突、金额与区块边界、status 等都在读取数据文件前抛出）
+            filters = _filters_from_args(args, parser, with_time=False)
+            if filters["address"] is None:
+                # 缺少观察地址报独立的 invalid_flow_series_filter；
+                # 空白值与 address/from/to 冲突仍报 invalid_filter
+                raise InvalidFlowSeriesFilter(
+                    "address-flow-time-series 必须指定 --address", None
+                )
+            # 范围倒置/负值与桶粒度取值也在读取数据文件前校验
+            validate_address_flow_time_series_params(
+                filters, flow_start, flow_end, args.bucket
+            )
+            page_size = _parse_page_size(args.page_size)
+
+            records = load_file(args.file)
+            indexer = TxIndexer(records)
+            result = indexer.address_flow_time_series(
+                filters,
+                flow_start,
+                flow_end,
                 args.bucket,
                 page_size=page_size,
                 cursor=args.cursor,
