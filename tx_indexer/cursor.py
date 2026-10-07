@@ -55,6 +55,8 @@ SCOPE_COUNTERPARTY_STATS = "counterparty-stats"
 SCOPE_TIME_STATS = "time-stats"
 SCOPE_PAIR_STATS = "pair-stats"
 SCOPE_ADDRESS_TIME_STATS = "address-time-stats"
+#: 时间区间 × method 联合汇总的作用域标识
+SCOPE_METHOD_TIME_STATS = "method-time-stats"
 #: 地址资金流向统计（sent/received/net 拆分）的作用域标识
 SCOPE_ADDRESS_FLOW_STATS = "address-flow-stats"
 #: 时间分桶聚合（连续 hour/day 桶、含空桶）的作用域标识
@@ -576,6 +578,73 @@ def decode_address_time_stats_cursor(token, filters, bucket_size):
     请求不一致时报 InvalidCursorError。
     """
     payload = _decode_payload(token, filters, SCOPE_ADDRESS_TIME_STATS)
+
+    saved_bucket_size = payload.get("b")
+    if (
+        not isinstance(saved_bucket_size, int)
+        or isinstance(saved_bucket_size, bool)
+        or saved_bucket_size != bucket_size
+    ):
+        raise InvalidCursorError("游标与当前 bucket_size 不匹配", None)
+
+    after = payload.get("after")
+    if (
+        not isinstance(after, list)
+        or len(after) != 6
+        or not isinstance(after[0], int)
+        or isinstance(after[0], bool)
+        or after[0] < 0
+        or not isinstance(after[1], int)
+        or isinstance(after[1], bool)
+        or after[1] < 0
+        or not isinstance(after[2], int)
+        or isinstance(after[2], bool)
+        or after[2] < 1
+        or not isinstance(after[3], int)
+        or isinstance(after[3], bool)
+        or after[3] < 0
+        or not isinstance(after[4], int)
+        or isinstance(after[4], bool)
+        or after[4] < 0
+        or not isinstance(after[5], str)
+        or after[5] == ""
+    ):
+        raise InvalidCursorError("游标位置信息非法", None)
+
+    return after[0], after[1], after[2], after[3], after[4], after[5]
+
+
+def encode_method_time_stats_cursor(filters, bucket_size,
+                                    after_bucket_start, after_total_amount,
+                                    after_total_count, after_success_count,
+                                    after_failure_count, after_method):
+    """method-time-stats 游标：除筛选（含 status、金额/区块数值边界）外
+    还绑定 bucket_size，不绑定 page_size。"""
+    payload = {
+        "v": _CURSOR_VERSION,
+        "c": SCOPE_METHOD_TIME_STATS,
+        "f": _canonical_filters(filters),
+        "b": bucket_size,
+        "after": [
+            after_bucket_start,
+            after_total_amount,
+            after_total_count,
+            after_success_count,
+            after_failure_count,
+            after_method,
+        ],
+    }
+    return _encode_payload(payload)
+
+
+def decode_method_time_stats_cursor(token, filters, bucket_size):
+    """解码并校验 method-time-stats 游标。
+
+    返回 exclusive marker ``(bucket_start, total_amount, total_count,
+    success_count, failure_count, method)``。游标内 bucket_size 与当前
+    请求不一致时报 InvalidCursorError。
+    """
+    payload = _decode_payload(token, filters, SCOPE_METHOD_TIME_STATS)
 
     saved_bucket_size = payload.get("b")
     if (

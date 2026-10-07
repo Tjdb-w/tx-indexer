@@ -1664,6 +1664,319 @@ class AddressTimeStatsTest(unittest.TestCase):
         self.assertEqual(groups["b"]["avg_amount"], str(int(total) // 2))
 
 
+class MethodTimeStatsTest(unittest.TestCase):
+    def setUp(self):
+        fail = dict(success=False)
+        self.records = [
+            rec("h1", 1, 10, "alice", "bob", "transfer", "10"),
+            rec("h2", 2, 20, "bob", "alice", "approve", "21"),
+            {**rec("h3", 2, 30, "alice", "carol", "transfer", "5"), **fail},
+            rec("h4", 3, 300, "bob", "dave", "transfer", "40"),
+            rec("h5", 4, 50, "carol", "dave", "mint", "100"),
+        ]
+        self.idx = TxIndexer(self.records)
+        self.filters = normalize_filters()
+
+    def test_grouping_and_aggregation(self):
+        result = self.idx.method_time_stats(self.filters, 60)
+        groups = result["groups"]
+        self.assertEqual(
+            [(g["bucket_start"], g["method"], g["total_count"],
+              g["total_amount"], g["success_count"], g["failure_count"])
+             for g in groups],
+            [
+                (0, "mint", 1, "100", 1, 0),
+                (0, "approve", 1, "21", 1, 0),
+                (0, "transfer", 2, "15", 1, 1),
+                (300, "transfer", 1, "40", 1, 0),
+            ],
+        )
+        self.assertEqual(result["total_groups"], 4)
+        self.assertIsNone(result["next_cursor"])
+
+    def test_group_field_order(self):
+        result = self.idx.method_time_stats(self.filters, 60)
+        self.assertEqual(
+            list(result.keys()), ["groups", "total_groups", "next_cursor"]
+        )
+        group = result["groups"][0]
+        self.assertEqual(
+            list(group.keys()),
+            ["bucket_start", "method", "total_count", "total_amount",
+             "success_count", "failure_count"],
+        )
+        self.assertIsInstance(group["bucket_start"], int)
+        self.assertIsInstance(group["total_amount"], str)
+        self.assertNotIn("avg_amount", group)
+        self.assertNotIn("bucket_end_exclusive", group)
+
+    def test_bucket_alignment_epoch_left_closed_right_open(self):
+        records = [
+            rec("b0", 1, 0, "a", "b", "m", "1"),
+            rec("b59", 2, 59, "a", "b", "m", "2"),
+            rec("b60", 3, 60, "a", "b", "m", "4"),
+            rec("b119", 4, 119, "a", "b", "m", "8"),
+            rec("b120", 5, 120, "a", "b", "m", "16"),
+        ]
+        result = TxIndexer(records).method_time_stats(self.filters, 60)
+        self.assertEqual(
+            [(g["bucket_start"], g["method"], g["total_amount"])
+             for g in result["groups"]],
+            [(0, "m", "3"), (60, "m", "12"), (120, "m", "16")],
+        )
+        self.assertEqual(result["total_groups"], 3)
+
+    def test_sort_amount_count_success_then_method_codepoint(self):
+        records = [
+            rec("r1", 1, 1, "a", "b", "zebra", "30"),
+            rec("r2", 2, 2, "a", "b", "banana", "10"),
+            {**rec("r3", 3, 3, "a", "b", "banana", "10"),
+             **dict(success=False)},
+            rec("r4", 4, 4, "a", "b", "a", "20"),
+            rec("r5", 5, 5, "a", "b", "b", "20"),
+            {**rec("r6", 6, 6, "a", "b", "cherry", "20"),
+             **dict(success=False)},
+        ]
+        result = TxIndexer(records).method_time_stats(normalize_filters(), 60)
+        # total_amount 降序：zebra(30)；同 20 时 count 高的 banana(2) 在前；
+        # 余下 count1 按 success 降序：a、b（成功）先于 cherry（失败），
+        # a、b 之间按 method 码点
+        self.assertEqual(
+            [g["method"] for g in result["groups"]],
+            ["zebra", "banana", "a", "b", "cherry"],
+        )
+
+    def test_missing_success_counts_as_success(self):
+        result = self.idx.method_time_stats(
+            normalize_filters(method="approve"), 60
+        )
+        group = result["groups"][0]
+        self.assertEqual(
+            (group["success_count"], group["failure_count"]), (1, 0)
+        )
+
+    def test_status_failure_other_side_zero(self):
+        result = self.idx.method_time_stats(
+            normalize_filters(status="failure"), 60
+        )
+        self.assertEqual(
+            [(g["bucket_start"], g["method"], g["total_count"],
+              g["total_amount"], g["success_count"], g["failure_count"])
+             for g in result["groups"]],
+            [(0, "transfer", 1, "5", 0, 1)],
+        )
+
+    def test_status_success_other_side_zero(self):
+        result = self.idx.method_time_stats(
+            normalize_filters(status="success"), 60
+        )
+        self.assertTrue(all(g["failure_count"] == 0 for g in result["groups"]))
+        self.assertTrue(all(g["success_count"] == g["total_count"]
+                            for g in result["groups"]))
+        self.assertEqual(result["total_groups"], 4)
+
+    def test_filters_intersect(self):
+        result = self.idx.method_time_stats(
+            normalize_filters(method="transfer", min_amount="40"), 60
+        )
+        self.assertEqual(
+            [(g["bucket_start"], g["method"], g["total_amount"])
+             for g in result["groups"]],
+            [(300, "transfer", "40")],
+        )
+
+    def test_time_window_inclusive_both_ends(self):
+        result = self.idx.method_time_stats(
+            normalize_filters(start_time=10, end_time=20), 60
+        )
+        self.assertEqual(
+            [(g["method"], g["total_amount"]) for g in result["groups"]],
+            [("approve", "21"), ("transfer", "10")],
+        )
+
+    def test_only_nonempty_bucket_method_groups_returned(self):
+        records = [
+            rec("a", 1, 10, "x", "y", "m", "1"),
+            rec("b", 2, 1000, "x", "y", "m", "2"),
+        ]
+        result = TxIndexer(records).method_time_stats(self.filters, 60)
+        self.assertEqual(
+            [(g["bucket_start"], g["method"]) for g in result["groups"]],
+            [(0, "m"), (960, "m")],
+        )
+
+    def test_no_match(self):
+        result = self.idx.method_time_stats(
+            normalize_filters(method="nonexistent"), 60
+        )
+        self.assertEqual(
+            result, {"groups": [], "total_groups": 0, "next_cursor": None}
+        )
+
+    def test_pagination_no_skip_no_dup_no_reorder(self):
+        all_keys = [
+            (g["bucket_start"], g["method"], g["total_amount"],
+             g["total_count"], g["success_count"], g["failure_count"])
+            for g in self.idx.method_time_stats(
+                self.filters, 60, page_size=100
+            )["groups"]
+        ]
+        collected = []
+        cursor = None
+        pages = 0
+        while True:
+            page = self.idx.method_time_stats(
+                self.filters, 60, page_size=2, cursor=cursor
+            )
+            pages += 1
+            collected.extend(
+                (g["bucket_start"], g["method"], g["total_amount"],
+                 g["total_count"], g["success_count"], g["failure_count"])
+                for g in page["groups"]
+            )
+            self.assertEqual(page["total_groups"], 4)
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(pages, 2)  # 4 组、page_size=2：2 页
+        self.assertEqual(collected, all_keys)
+
+    def test_last_page_exactly_full_then_null(self):
+        page1 = self.idx.method_time_stats(self.filters, 60, page_size=4)
+        self.assertEqual(len(page1["groups"]), 4)
+        self.assertIsNone(page1["next_cursor"])
+
+    def test_cursor_not_bound_to_page_size(self):
+        page1 = self.idx.method_time_stats(self.filters, 60, page_size=1)
+        page2 = self.idx.method_time_stats(
+            self.filters, 60, page_size=100, cursor=page1["next_cursor"]
+        )
+        self.assertEqual(
+            [(g["bucket_start"], g["method"]) for g in page2["groups"]],
+            [(0, "approve"), (0, "transfer"), (300, "transfer")],
+        )
+        self.assertIsNone(page2["next_cursor"])
+
+    def test_cursor_bound_to_bucket_size(self):
+        page1 = self.idx.method_time_stats(self.filters, 60, page_size=1)
+        with self.assertRaises(InvalidCursorError):
+            self.idx.method_time_stats(
+                self.filters, 30, page_size=1, cursor=page1["next_cursor"]
+            )
+
+    def test_cursor_bound_to_filters(self):
+        page1 = self.idx.method_time_stats(self.filters, 60, page_size=1)
+        with self.assertRaises(InvalidCursorError):
+            self.idx.method_time_stats(
+                normalize_filters(method="transfer"),
+                60, page_size=1, cursor=page1["next_cursor"],
+            )
+        with self.assertRaises(InvalidCursorError):
+            self.idx.method_time_stats(
+                normalize_filters(status="failure"),
+                60, page_size=1, cursor=page1["next_cursor"],
+            )
+        with self.assertRaises(InvalidCursorError):
+            self.idx.method_time_stats(
+                normalize_filters(min_amount="10"),
+                60, page_size=1, cursor=page1["next_cursor"],
+            )
+        with self.assertRaises(InvalidCursorError):
+            self.idx.method_time_stats(
+                normalize_filters(max_block=2),
+                60, page_size=1, cursor=page1["next_cursor"],
+            )
+
+    def test_cursor_amount_leading_zeros_equivalent(self):
+        page1 = self.idx.method_time_stats(
+            normalize_filters(min_amount="5"), 60, page_size=1
+        )
+        page2 = self.idx.method_time_stats(
+            normalize_filters(min_amount="005"), 60,
+            page_size=2, cursor=page1["next_cursor"],
+        )
+        self.assertEqual(page2["total_groups"], page1["total_groups"])
+
+    def test_cross_command_cursor_rejected(self):
+        from tx_indexer.cursor import (
+            decode_method_stats_cursor,
+            decode_method_status_stats_cursor,
+            decode_method_time_stats_cursor,
+            decode_time_stats_cursor,
+            encode_method_stats_cursor,
+            encode_method_status_stats_cursor,
+            encode_method_time_stats_cursor,
+            encode_time_stats_cursor,
+        )
+
+        filters = normalize_filters()
+        mts_cursor = encode_method_time_stats_cursor(
+            filters, 60, 0, 10, 1, 1, 0, "m"
+        )
+        time_cursor = encode_time_stats_cursor(filters, 60, 0)
+        method_cursor = encode_method_stats_cursor(filters, 10, 1, "m")
+        method_status_cursor = encode_method_status_stats_cursor(
+            filters, 10, 1, 1, 0, "m"
+        )
+        for decode in (
+            lambda t: decode_time_stats_cursor(t, filters, 60),
+            lambda t: decode_method_stats_cursor(t, filters),
+            lambda t: decode_method_status_stats_cursor(t, filters),
+        ):
+            with self.assertRaises(InvalidCursorError):
+                decode(mts_cursor)
+        with self.assertRaises(InvalidCursorError):
+            decode_method_time_stats_cursor(time_cursor, filters, 60)
+        with self.assertRaises(InvalidCursorError):
+            decode_method_time_stats_cursor(method_cursor, filters, 60)
+        with self.assertRaises(InvalidCursorError):
+            decode_method_time_stats_cursor(method_status_cursor, filters, 60)
+
+    def test_cursor_garbage(self):
+        for bad in ("", "not-base64!!!", "bm9wZQ", "%%%"):
+            with self.assertRaises(InvalidCursorError):
+                self.idx.method_time_stats(self.filters, 60, cursor=bad)
+
+    def test_cursor_tampered(self):
+        import base64
+        import json
+
+        page1 = self.idx.method_time_stats(self.filters, 60, page_size=1)
+        token = page1["next_cursor"]
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+        payload = json.loads(raw.decode("utf-8"))
+        payload["b"] = 30  # 篡改 bucket_size
+        tampered = base64.urlsafe_b64encode(
+            json.dumps(payload).encode("utf-8")
+        ).rstrip(b"=").decode("ascii")
+        with self.assertRaises(InvalidCursorError):
+            self.idx.method_time_stats(self.filters, 60, cursor=tampered)
+
+    def test_invalid_bucket_size(self):
+        for bad in (0, -1, -60, "60", 1.5, True, None):
+            with self.assertRaises(InvalidBucketSizeError):
+                self.idx.method_time_stats(self.filters, bad)
+
+    def test_invalid_page_size(self):
+        for bad in (0, -1, 1001, "10", None):
+            with self.assertRaises(InvalidPageSizeError):
+                self.idx.method_time_stats(self.filters, 60, page_size=bad)
+
+    def test_big_amounts_exact_decimal(self):
+        big = "123456789012345678901234567890"
+        idx = TxIndexer([
+            rec("x", 1, 1, "a", "b", "m", big),
+            rec("y", 2, 2, "a", "b", "m", "10"),
+        ])
+        result = idx.method_time_stats(normalize_filters(), 60)
+        group = result["groups"][0]
+        self.assertEqual(group["total_amount"], str(int(big) + 10))
+        self.assertEqual(group["total_count"], 2)
+        self.assertEqual(
+            (group["success_count"], group["failure_count"]), (2, 0)
+        )
+
+
 class AmountFilterTest(unittest.TestCase):
     def setUp(self):
         self.records = [

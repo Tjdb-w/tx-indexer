@@ -1519,6 +1519,206 @@ class CliTest(unittest.TestCase):
         self.assertEqual(payload["input_line"], 2)
 
 
+class MethodTimeStatsCliTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "data.jsonl")
+        lines = [
+            {"tx_hash": "h1", "block_number": 1, "timestamp": 10,
+             "from_address": "alice", "to_address": "bob",
+             "method": "transfer", "amount": "10"},
+            {"tx_hash": "h2", "block_number": 2, "timestamp": 20,
+             "from_address": "bob", "to_address": "alice",
+             "method": "approve", "amount": "21"},
+            {"tx_hash": "h3", "block_number": 2, "timestamp": 30,
+             "from_address": "alice", "to_address": "carol",
+             "method": "transfer", "amount": "5", "success": False},
+        ]
+        with open(self.path, "w", encoding="utf-8") as fh:
+            for obj in lines:
+                fh.write(json.dumps(obj) + "\n")
+        self._stdout, self._stderr = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+
+    def tearDown(self):
+        sys.stdout, sys.stderr = self._stdout, self._stderr
+        self.tmp.cleanup()
+
+    def _run(self, argv):
+        sys.stdout.seek(0)
+        sys.stdout.truncate(0)
+        sys.stderr.seek(0)
+        sys.stderr.truncate(0)
+        code = main(argv)
+        out = sys.stdout.getvalue()
+        err = sys.stderr.getvalue()
+        return code, json.loads(out) if out.strip() else None, err
+
+    def test_method_time_stats_buckets_and_order(self):
+        code, result, _ = self._run([
+            "method-time-stats", self.path, "--bucket-size", "15"])
+        self.assertEqual(code, 0)
+        self.assertEqual(result["groups"], [
+            {"bucket_start": 0, "method": "transfer", "total_count": 1,
+             "total_amount": "10", "success_count": 1, "failure_count": 0},
+            {"bucket_start": 15, "method": "approve", "total_count": 1,
+             "total_amount": "21", "success_count": 1, "failure_count": 0},
+            {"bucket_start": 30, "method": "transfer", "total_count": 1,
+             "total_amount": "5", "success_count": 0, "failure_count": 1},
+        ])
+        self.assertEqual(result["total_groups"], 3)
+        self.assertIsNone(result["next_cursor"])
+
+    def test_method_time_stats_default_page_size_100(self):
+        code, result, _ = self._run([
+            "method-time-stats", self.path, "--bucket-size", "60"])
+        self.assertEqual(code, 0)
+        # bucket 0：approve 21 先于 transfer 15；失败的 h3 仍计入该组
+        self.assertEqual(result["groups"], [
+            {"bucket_start": 0, "method": "approve", "total_count": 1,
+             "total_amount": "21", "success_count": 1, "failure_count": 0},
+            {"bucket_start": 0, "method": "transfer", "total_count": 2,
+             "total_amount": "15", "success_count": 1, "failure_count": 1},
+        ])
+        self.assertEqual(result["total_groups"], 2)
+
+    def test_method_time_stats_walk_all_pages(self):
+        collected = []
+        cursor = None
+        while True:
+            argv = ["method-time-stats", self.path,
+                    "--bucket-size", "15", "--page-size", "2"]
+            if cursor is not None:
+                argv += ["--cursor", cursor]
+            code, page, _ = self._run(argv)
+            self.assertEqual(code, 0)
+            collected.extend(
+                (g["bucket_start"], g["method"]) for g in page["groups"]
+            )
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(collected, [
+            (0, "transfer"), (15, "approve"), (30, "transfer"),
+        ])
+
+    def test_method_time_stats_status_filter(self):
+        code, page, _ = self._run([
+            "method-time-stats", self.path, "--bucket-size", "60",
+            "--status", "failure"])
+        self.assertEqual(code, 0)
+        self.assertEqual(page["groups"], [
+            {"bucket_start": 0, "method": "transfer", "total_count": 1,
+             "total_amount": "5", "success_count": 0, "failure_count": 1},
+        ])
+        self.assertEqual(page["total_groups"], 1)
+
+    def test_method_time_stats_no_match(self):
+        code, page, _ = self._run([
+            "method-time-stats", self.path, "--bucket-size", "60",
+            "--method", "x"])
+        self.assertEqual(code, 0)
+        self.assertEqual(page, {
+            "groups": [], "total_groups": 0, "next_cursor": None,
+        })
+
+    def test_missing_bucket_size_exit_2_before_read(self):
+        missing = os.path.join(self.tmp.name, "missing.jsonl")
+        code, out, err = self._run(["method-time-stats", missing])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_bucket_size")
+        self.assertIsNone(payload["input_line"])
+
+    def test_invalid_bucket_size_exit_2(self):
+        for bad in ("abc", "0", "-5", "1.5", ""):
+            code, out, err = self._run([
+                "method-time-stats", self.path, "--bucket-size", bad])
+            self.assertEqual(code, 2)
+            self.assertIsNone(out)
+            self.assertEqual(
+                json.loads(err)["error"], "invalid_bucket_size"
+            )
+
+    def test_invalid_page_size_exit_2(self):
+        code, out, err = self._run([
+            "method-time-stats", self.path, "--bucket-size", "60",
+            "--page-size", "1001"])
+        self.assertEqual(code, 2)
+        self.assertIsNone(out)
+        self.assertEqual(json.loads(err)["error"], "invalid_page_size")
+
+    def test_cross_command_cursor_exit_2(self):
+        for source, extra in (
+            ("query", []),
+            ("method-stats", []),
+            ("method-status-stats", []),
+            ("time-stats", ["--bucket-size", "15"]),
+            ("address-time-stats", ["--bucket-size", "15"]),
+        ):
+            code, src_page, _ = self._run(
+                [source, self.path, "--page-size", "1"] + extra)
+            self.assertEqual(code, 0)
+            self.assertIsNotNone(src_page["next_cursor"])
+            code, out, err = self._run([
+                "method-time-stats", self.path, "--bucket-size", "15",
+                "--cursor", src_page["next_cursor"]])
+            self.assertEqual(code, 2)
+            self.assertIsNone(out)
+            self.assertEqual(json.loads(err)["error"], "invalid_cursor")
+
+    def test_cursor_not_bound_to_page_size(self):
+        code, page1, _ = self._run([
+            "method-time-stats", self.path, "--bucket-size", "15",
+            "--page-size", "1"])
+        self.assertEqual(code, 0)
+        code, page2, _ = self._run([
+            "method-time-stats", self.path, "--bucket-size", "15",
+            "--page-size", "100", "--cursor", page1["next_cursor"]])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [(g["bucket_start"], g["method"]) for g in page2["groups"]],
+            [(15, "approve"), (30, "transfer")],
+        )
+        self.assertIsNone(page2["next_cursor"])
+
+    def test_cursor_bound_to_status_and_amount(self):
+        code, page1, _ = self._run([
+            "method-time-stats", self.path, "--bucket-size", "60",
+            "--page-size", "1", "--min-amount", "5"])
+        self.assertEqual(code, 0)
+        for flag, value in (("--max-amount", "9"), ("--status", "failure")):
+            code, out, err = self._run([
+                "method-time-stats", self.path, "--bucket-size", "60",
+                "--page-size", "1", flag, value,
+                "--cursor", page1["next_cursor"]])
+            self.assertEqual(code, 2)
+            self.assertIsNone(out)
+            self.assertEqual(json.loads(err)["error"], "invalid_cursor")
+        # 仅前导零不同：金额边界数值等价，可续翻
+        code, page2, _ = self._run([
+            "method-time-stats", self.path, "--bucket-size", "60",
+            "--page-size", "1", "--min-amount", "005",
+            "--cursor", page1["next_cursor"]])
+        self.assertEqual(code, 0)
+        self.assertEqual(page2["total_groups"], 2)
+
+    def test_data_error_has_line_no(self):
+        bad = os.path.join(self.tmp.name, "bad_mts.jsonl")
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write('{"tx_hash":"x1","block_number":1,"timestamp":1,'
+                     '"from_address":"a","to_address":"b","method":"m",'
+                     '"amount":"1"}\n')
+            fh.write("{broken\n")
+        code, _, err = self._run(
+            ["method-time-stats", bad, "--bucket-size", "60"])
+        self.assertEqual(code, 2)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"], "invalid_transaction")
+        self.assertEqual(payload["input_line"], 2)
+
+
 class AmountFilterCliTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
