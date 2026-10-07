@@ -706,6 +706,85 @@ summary = manager.stats("chain-a", normalize_filters(method="transfer"))
 
 `IncrementalImporter`、JSON Lines、CLI 与既有输出不受影响。
 
+## 可重放的分批增量导入与链分叉修正
+
+`tx_indexer.fork.ForkAwareImporter`（等价别名 `ForkCorrectingImporter`）
+在现有查询索引之上提供可重放的分批增量导入：批次通过父区块哈希逐个
+链接到引擎当前末端，同一批次可安全重复提交；当同一条来源链出现更高
+区块高度的新分支时，用新分支整体取代从分叉点开始的旧分支。导入与
+查询共享同一份内存索引，批次应用成功后查询与聚合立即只反映当前
+有效分支。
+
+```python
+from tx_indexer.fork import ForkAwareImporter
+
+importer = ForkAwareImporter()
+result = importer.import_batch(batch)          # 逐批追加 / 幂等重放
+result = importer.apply_branch(new_batches)    # 链分叉修正（等价别名 replace_branch）
+page = importer.query(normalize_filters(), page_size=20)
+stats = importer.stats(normalize_filters())
+indexer = importer.indexer                     # 底层 TxIndexer，全部统计入口可用
+```
+
+批次结构（字段接受等价别名：`source_chain_id`/`chain_id`、
+`batch_seq`/`batch_sequence`/`seq`、`parent_block_hash`/`parent_hash`、
+`block_height`/`block_number`/`height`；未定义的额外字段被忽略）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `source_chain_id` | 非空字符串 | 来源链标识；首个批次确定后不可变更 |
+| `batch_seq` | 正整数 | 批次序号，用于幂等重放判重 |
+| `parent_block_hash` | 非空字符串 | 父区块哈希，必须等于引擎当前末端区块哈希 |
+| `block_hash` | 非空字符串 | 本批区块哈希 |
+| `block_height` | 非负整数 | 本批区块高度，必须在父区块高度上 +1 |
+| `transactions` | 数组 | 该区块内的交易列表，沿用公开交易记录字段与语义（`tx_hash` / `block_number` / `timestamp` / `from_address` / `to_address` / `method` / `amount`，可选 `success`；`block_number` 必须等于批次区块高度） |
+
+- 批次连续时按区块高度顺序建立或更新索引；`parent_block_hash` 不等于
+  引擎当前末端区块哈希（或高度无法衔接、来源链标识不符）时抛
+  `BlockLinkMismatchError`，导入前的索引、统计与查询结果保持不变。
+- 重复提交来源链标识、区块哈希与批次序号均相同的批次时返回
+  `{"status": "already_applied", "imported_count": 0, "skipped_count": 0,
+  "tip_block_height", "tip_block_hash"}`，不重复写入交易，也不重复
+  累计统计。成功导入返回 `{"status": "ok", "imported_count",
+  "skipped_count", "tip_block_height", "tip_block_hash"}`。
+- 来源链标识为空、区块高度小于零、批次序号非正数，或批次/交易字段
+  类型非法时抛 `InvalidImportBatchError`，且不改变现有数据。
+
+### 链分叉修正（apply_branch）
+
+`apply_branch(batches)` 接收新分支批次组成的非空列表：首个批次的
+`parent_block_hash` 必须等于当前分支上某一区块的哈希（分叉点父块，
+等于末端哈希时为纯追加），列表内部父哈希与区块高度连续衔接，且新
+分支末端高度必须高于当前末端高度，否则抛 `BlockLinkMismatchError`；
+批次内出现重复区块哈希（含与保留前缀重复）抛
+`InvalidImportBatchError`。所有校验都在任何状态修改之前完成。
+
+成功时引擎先撤销被替代区块中交易的地址索引、方法索引、时间窗索引
+与聚合贡献，再按区块高度顺序应用新分支；回滚期间交易哈希相同仍按
+当前分支内去重（保留前缀与新分支内已存在的哈希只写入一次、不重复
+计数，被回滚的哈希可在新分支中重新写入）。返回确定结果：
+
+```json
+{
+  "status": "ok",
+  "rolled_back_block_count": 2,
+  "applied_block_count": 3,
+  "rolled_back_transaction_count": 2,
+  "imported_count": 3,
+  "skipped_count": 0,
+  "tip_block_height": 4,
+  "tip_block_hash": "0xc4",
+  "current_tip_block_hash": "0xc4"
+}
+```
+
+新分支应用后，所有查询只反映当前有效分支，聚合数值与明细过滤结果
+保持一致；此前生成的分页游标如果指向已回滚交易，
+`ForkAwareImporter.query` 抛 `CursorOutOfRangeError`，不返回旧分支
+数据（指向仍然存在的交易的游标可正常续翻）。时间边界、空结果、
+排序顺序与游标稳定性继续采用既有语义，普通查询的输出字段、分页
+粒度与兼容范围不变。
+
 ## 错误处理
 
 领域错误输出到 stderr（单行 JSON，含 `error`、`message`、`input_line`），退出码为 `2`。只有输入数据行错误才带 1 起始行号，其余错误 `input_line` 为 `null`。
@@ -760,6 +839,15 @@ method 时间序列（method-time-series）同样使用独立的错误类型与�
 | `SourceUnavailableError` | `source_unavailable` | 上游暂时无法返回指定区块（fetch 抛出或返回缺少区间内区块） |
 | `TransactionConflictError` | `transaction_conflict` | 相同交易哈希再次出现但区块高度、时间、地址或方法标识不同 |
 
+可重放的分批增量导入与链分叉修正（`ForkAwareImporter`）同样使用
+Python 异常，不走 CLI 错误输出：
+
+| 异常 | error 码 | 触发条件 |
+| --- | --- | --- |
+| `InvalidImportBatchError` | `invalid_import_batch` | 来源链标识为空、区块高度小于零、批次序号非正数、批次内出现重复区块哈希，或批次/交易字段类型非法 |
+| `BlockLinkMismatchError` | `block_link_mismatch` | 批次父区块哈希与引擎当前末端区块哈希不一致、高度无法衔接、来源链标识不符、分叉点不在当前分支上，或新分支末端高度不高于当前末端 |
+| `CursorOutOfRangeError` | `cursor_out_of_range` | 分页游标指向已回滚（不再属于当前有效分支）的交易 |
+
 ## 代码结构
 
 - `tx_indexer/loader.py`：JSON Lines 解析与校验
@@ -767,10 +855,11 @@ method 时间序列（method-time-series）同样使用独立的错误类型与�
 - `tx_indexer/cursor.py`：不透明游标编解码（base64url），含独立的导入游标、时间分桶聚合游标、method 时间序列游标与地址资金流向时间序列游标
 - `tx_indexer/importer.py`：增量交易导入与断点续传
 - `tx_indexer/replay.py`：索引水位与幂等重放（按链水位、原子批次、并发串行化）；`MultiChainReplayManager` 在多个 chain_id 共用入口时按链隔离身份、索引、水位、并发与游标
+- `tx_indexer/fork.py`：可重放的分批增量导入与链分叉修正（父哈希链接、幂等重放、回滚撤销与分支内去重、回滚游标检测）
 - `tx_indexer/errors.py`：异常类型
 - `tx_indexer/cli.py`：命令行入口
 - `tests/`：unittest 测试（`python3 -m unittest discover -s tests`）
 
 ## 状态
 
-已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按 method 拆分成功/失败分页汇总（method-status-stats：每组返回 method/total_count/total_amount/avg_amount/success_count/failure_count/success_amount/failure_amount，success 缺省计成功、金额无前导零十进制字符串、avg_amount 整除向下取整，按 total_amount/total_count/success_count/failure_count 降序、method 码点升序，游标绑定命令与等价筛选含 status、不绑 page-size，指定单一 status 时另一状态计数金额全 0，非法筛选/分页/游标/数据沿用既有错误码）、按参与地址分页汇总（address-stats）、按参与地址 × method 交叉分页汇总（address-method-stats / `TxIndexer.address_method_stats(filters, page_size=100, cursor=None)`：匹配交易的发送方与接收方按各自 method 原字符串分别计入 `(地址, method)` 组的 send_count / receive_count，同一地址不同 method 归不同组；自转账只进一个组，total_count/total_amount/成功失败计数各计一次、send_count/receive_count 各加一；每组返回 address/method/send_count/receive_count/total_count/total_amount/success_count/failure_count/avg_amount，金额为无前导零十进制字符串、avg_amount 整除向下取整，total_count = success_count + failure_count，未携带 success 计成功、指定单一 status 时另一侧计数为 0；按 total_amount/total_count/send_count/receive_count 降序、address/method 码点升序，游标绑定命令与等价筛选含 status/金额/区块数值边界、不绑 page-size，篡改/解码失败/跨命令复用/改变条件报 invalid_cursor，非法筛选/分页/数据沿用既有错误码）、按地址拆分发送/接收资金流向分页汇总（address-flow-stats：每笔匹配交易金额分别计入 from_address 的 sent_amount 与 to_address 的 received_amount，自转账两方各计、total_count 只计一次，net_amount = received - sent 可带负号，按 net/sent/received/total_count 降序、address 码点升序，游标绑定命令与等价筛选不绑 page-size，非法筛选/分页/游标/数据沿用既有错误码）、按交易对手分页汇总（counterparty-stats）、按固定宽度时间区间分页汇总（time-stats）、按有向交易对分页汇总（pair-stats）、按时间区间 × 参与地址分页汇总（address-time-stats）、按时间区间 × method 联合分页汇总（method-time-stats / `TxIndexer.method_time_stats(filters, bucket_size, page_size=100, cursor=None)`：沿用 query 全部筛选取交集，匹配交易按纪元对齐、左闭右开固定宽度区间分桶后按 method 原字符串分组，只返回非空组，每组返回 bucket_start/method/total_count/total_amount/success_count/failure_count，total_amount 为无前导零十进制字符串，未携带 success 计成功、指定单一 status 时另一侧计数为 0，按 bucket_start 升序、同桶 total_amount/total_count/success_count/failure_count 数值降序、method 码点升序，游标绑定命令、等价筛选含 status/金额/区块数值边界与 bucket_size、不绑 page-size，篡改/解码失败/跨命令复用/改变条件报 invalid_cursor，bucket_size 缺失、非整数或不大于 0 报 invalid_bucket_size、page_size 非法报 invalid_page_size，导入、替换、重放及既有查询统计入口不变）与领域异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选；`--min-amount` / `--max-amount` 金额闭区间筛选（按十进制整数数值比较、前导零等价、与其他筛选取交集，query/stats/六类分组统计与多链入口全部基于命中交易重算，非法值报 `invalid_amount_filter`、区间倒置报 `invalid_amount_range`，游标按数值等价绑定金额边界）；增量交易导入与断点续传（原子批次、重试判重、四类机器可读拒绝码、独立导入游标）；链重组后缀替换（`replace_from`，原子覆盖已导入高度至链尖、保留更低前缀、旧后缀同名不冲突、四类计数字段与 `INVALID_REPLACEMENT_BATCH` 拒绝码）；索引水位与幂等重放（`ReplayManager.submit` / `status`：按链连续水位、升序分批、整批原子提交、重复跳过、`TransactionConflictError` 冲突停止、`SourceUnavailableError` 断点续传、同链并发合并/等待、不扫描明细的只读状态入口）；多链共用入口 `MultiChainReplayManager`（按链隔离的独立 `ReplayManager`：跨链同哈希属不同交易、异链独立不阻塞、submit/status/query/stats 返回口径不变、query 游标绑定 chain_id 与等价筛选，跨链/改筛选/与单索引游标互用均抛 `InvalidCursorError`；IncrementalImporter、JSON Lines、CLI 与既有输出不变）；时间分桶聚合（`time-bucket-aggregation` / `TxIndexer.time_bucket_aggregation`：必填左闭右开时间窗与 hour/day 桶粒度、可选 address/method，UTC 整点/整日连续桶含空桶零填充、total/success/failure 计数，游标绑定完整查询条件与桶粒度、不绑定 page-size、末页之后为空页与空游标；`invalid_aggregation_range` / `unsupported_aggregation_bucket` / `invalid_aggregation_filter` / `invalid_aggregation_cursor` 四类独立错误，全部先于分页数据抛出，既有查询、聚合统计与游标结果不变）；method 时间序列（`method-time-series` / `TxIndexer.method_time_series(filters, start_time, end_time, bucket, page_size=100, cursor=None)`：沿用 query 全部筛选取交集，必填左闭右开时间窗与 hour/day 桶粒度，窗内命中交易的 method 原字符串入选，每个入选 method 覆盖范围内全部连续桶（首桶纪元对齐可早于 start-time、末桶只计 end-time 前数据，空桶计数为 0、金额为 `"0"`），每点返回 method/bucket_start/total_count/total_amount/success_count/failure_count（金额为无前导零十进制字符串、未携带 success 计成功），按 bucket_start 升序、同桶 method 码点升序，返回 total_points/total_methods/total_buckets（total_points = total_methods × total_buckets），无命中交易时 series 为空；游标绑定等价筛选、时间窗与桶粒度、不绑 page-size，篡改/解码失败/跨命令复用/改变条件报 `invalid_series_cursor`，时间范围缺失/非法/为负/倒置报 `invalid_series_range`、桶粒度缺失/非法报 `unsupported_series_bucket`、page_size 非法报 `invalid_page_size`，全部先于分页数据抛出，通用筛选与数据文件错误沿用既有错误码，既有命令行为不变）；地址资金流向时间序列（`address-flow-time-series` / `TxIndexer.address_flow_time_series(filters, start_time, end_time, bucket, page_size=100, cursor=None)`：沿用 query 全部筛选取交集，必填观察地址 address（缺失报 `invalid_flow_series_filter`，与 from/to 并用仍报 `invalid_filter`），必填左闭右开时间窗与 hour/day 桶粒度，窗内命中交易按纪元对齐到全部连续桶（首桶纪元对齐可早于 start-time、末桶只计 end-time 前数据），相对观察地址拆分 sent/received：发送方计 sent_count/sent_amount、接收方计 received_count/received_amount，自转账两侧累计但 total_count 一次，每点返回 bucket_start/sent_count/received_count/total_count/sent_amount/received_amount/net_amount，金额为无前导零十进制字符串、net_amount = received - sent 可带负号、零为 `"0"`，按 bucket_start 升序，空桶零值填充、无命中时返回等长零值序列，返回 total_points/total_buckets（二者相同）；游标绑定命令、观察地址、等价筛选、时间窗与桶粒度、不绑 page-size，末页之后为空页与空游标，篡改/解码失败/跨命令复用/改变条件报 `invalid_flow_series_cursor`，时间范围缺失/非法/为负/倒置报 `invalid_flow_series_range`、桶粒度缺失/非法报 `unsupported_flow_series_bucket`、page_size 非法报 `invalid_page_size`，全部先于分页数据抛出，通用筛选与数据文件错误沿用既有错误码，既有命令行为不变）；区块高度筛选（`--min-block` / `--max-block` 与 `normalize_filters(min_block=…, max_block=…)`：含端点的非负整数闭区间，可单独提供并与既有筛选取交集，query/stats/六类分组统计全部基于命中交易重算 `total` / `total_count` / `total_groups`；非法边界报 `invalid_block_filter`、区间倒置报 `invalid_block_range`，均在读取数据文件前抛出；游标按数值等价绑定区块边界，仅前导零不同仍同条件，不携带边界字段的旧游标仅在未指定边界时可续翻；time-bucket-aggregation 与导入、替换、回放入口不变）；记录级成功状态与状态筛选（JSON Lines 新增可选 `success` 布尔字段：只能为 `true`/`false`、缺省 `true`，`0`/`1`/字符串/`null` 报 `invalid_transaction` 并保留物理行号，既有字段与 `amount` 格式不变、其他额外字段仍非法；全部查询统计入口可选 `--status success|failure`，大小写敏感、缺省不筛、与既有筛选取交集，空/空白/大小写变体/非 success/failure/非字符串在读数据前报 `invalid_status_filter`；`status` 绑定分页游标，改状态复用旧游标报 `invalid_cursor`，未携带 status 的旧游标仅在未指定状态时可续翻；新入口 `status-stats` 无游标返回 `total_count`/`success_count`/`failure_count`/`success_amount`/`failure_amount`，金额为十进制整数字符串，空结果全 0、指定状态时另一状态全 0；query 排序/total/统计结构/total_groups/左闭右闭时间窗、time-bucket-aggregation 左闭右开连续桶/空桶/错误优先级、导入替换回放均不变）。
+已实现：公开查询、游标分页、聚合统计、按 method 分页汇总（method-stats）、按 method 拆分成功/失败分页汇总（method-status-stats：每组返回 method/total_count/total_amount/avg_amount/success_count/failure_count/success_amount/failure_amount，success 缺省计成功、金额无前导零十进制字符串、avg_amount 整除向下取整，按 total_amount/total_count/success_count/failure_count 降序、method 码点升序，游标绑定命令与等价筛选含 status、不绑 page-size，指定单一 status 时另一状态计数金额全 0，非法筛选/分页/游标/数据沿用既有错误码）、按参与地址分页汇总（address-stats）、按参与地址 × method 交叉分页汇总（address-method-stats / `TxIndexer.address_method_stats(filters, page_size=100, cursor=None)`：匹配交易的发送方与接收方按各自 method 原字符串分别计入 `(地址, method)` 组的 send_count / receive_count，同一地址不同 method 归不同组；自转账只进一个组，total_count/total_amount/成功失败计数各计一次、send_count/receive_count 各加一；每组返回 address/method/send_count/receive_count/total_count/total_amount/success_count/failure_count/avg_amount，金额为无前导零十进制字符串、avg_amount 整除向下取整，total_count = success_count + failure_count，未携带 success 计成功、指定单一 status 时另一侧计数为 0；按 total_amount/total_count/send_count/receive_count 降序、address/method 码点升序，游标绑定命令与等价筛选含 status/金额/区块数值边界、不绑 page-size，篡改/解码失败/跨命令复用/改变条件报 invalid_cursor，非法筛选/分页/数据沿用既有错误码）、按地址拆分发送/接收资金流向分页汇总（address-flow-stats：每笔匹配交易金额分别计入 from_address 的 sent_amount 与 to_address 的 received_amount，自转账两方各计、total_count 只计一次，net_amount = received - sent 可带负号，按 net/sent/received/total_count 降序、address 码点升序，游标绑定命令与等价筛选不绑 page-size，非法筛选/分页/游标/数据沿用既有错误码）、按交易对手分页汇总（counterparty-stats）、按固定宽度时间区间分页汇总（time-stats）、按有向交易对分页汇总（pair-stats）、按时间区间 × 参与地址分页汇总（address-time-stats）、按时间区间 × method 联合分页汇总（method-time-stats / `TxIndexer.method_time_stats(filters, bucket_size, page_size=100, cursor=None)`：沿用 query 全部筛选取交集，匹配交易按纪元对齐、左闭右开固定宽度区间分桶后按 method 原字符串分组，只返回非空组，每组返回 bucket_start/method/total_count/total_amount/success_count/failure_count，total_amount 为无前导零十进制字符串，未携带 success 计成功、指定单一 status 时另一侧计数为 0，按 bucket_start 升序、同桶 total_amount/total_count/success_count/failure_count 数值降序、method 码点升序，游标绑定命令、等价筛选含 status/金额/区块数值边界与 bucket_size、不绑 page-size，篡改/解码失败/跨命令复用/改变条件报 invalid_cursor，bucket_size 缺失、非整数或不大于 0 报 invalid_bucket_size、page_size 非法报 invalid_page_size，导入、替换、重放及既有查询统计入口不变）与领域异常；`--from-address` / `--to-address` / 可重复 `--method` 组合筛选；`--min-amount` / `--max-amount` 金额闭区间筛选（按十进制整数数值比较、前导零等价、与其他筛选取交集，query/stats/六类分组统计与多链入口全部基于命中交易重算，非法值报 `invalid_amount_filter`、区间倒置报 `invalid_amount_range`，游标按数值等价绑定金额边界）；增量交易导入与断点续传（原子批次、重试判重、四类机器可读拒绝码、独立导入游标）；链重组后缀替换（`replace_from`，原子覆盖已导入高度至链尖、保留更低前缀、旧后缀同名不冲突、四类计数字段与 `INVALID_REPLACEMENT_BATCH` 拒绝码）；索引水位与幂等重放（`ReplayManager.submit` / `status`：按链连续水位、升序分批、整批原子提交、重复跳过、`TransactionConflictError` 冲突停止、`SourceUnavailableError` 断点续传、同链并发合并/等待、不扫描明细的只读状态入口）；多链共用入口 `MultiChainReplayManager`（按链隔离的独立 `ReplayManager`：跨链同哈希属不同交易、异链独立不阻塞、submit/status/query/stats 返回口径不变、query 游标绑定 chain_id 与等价筛选，跨链/改筛选/与单索引游标互用均抛 `InvalidCursorError`；IncrementalImporter、JSON Lines、CLI 与既有输出不变）；时间分桶聚合（`time-bucket-aggregation` / `TxIndexer.time_bucket_aggregation`：必填左闭右开时间窗与 hour/day 桶粒度、可选 address/method，UTC 整点/整日连续桶含空桶零填充、total/success/failure 计数，游标绑定完整查询条件与桶粒度、不绑定 page-size、末页之后为空页与空游标；`invalid_aggregation_range` / `unsupported_aggregation_bucket` / `invalid_aggregation_filter` / `invalid_aggregation_cursor` 四类独立错误，全部先于分页数据抛出，既有查询、聚合统计与游标结果不变）；method 时间序列（`method-time-series` / `TxIndexer.method_time_series(filters, start_time, end_time, bucket, page_size=100, cursor=None)`：沿用 query 全部筛选取交集，必填左闭右开时间窗与 hour/day 桶粒度，窗内命中交易的 method 原字符串入选，每个入选 method 覆盖范围内全部连续桶（首桶纪元对齐可早于 start-time、末桶只计 end-time 前数据，空桶计数为 0、金额为 `"0"`），每点返回 method/bucket_start/total_count/total_amount/success_count/failure_count（金额为无前导零十进制字符串、未携带 success 计成功），按 bucket_start 升序、同桶 method 码点升序，返回 total_points/total_methods/total_buckets（total_points = total_methods × total_buckets），无命中交易时 series 为空；游标绑定等价筛选、时间窗与桶粒度、不绑 page-size，篡改/解码失败/跨命令复用/改变条件报 `invalid_series_cursor`，时间范围缺失/非法/为负/倒置报 `invalid_series_range`、桶粒度缺失/非法报 `unsupported_series_bucket`、page_size 非法报 `invalid_page_size`，全部先于分页数据抛出，通用筛选与数据文件错误沿用既有错误码，既有命令行为不变）；地址资金流向时间序列（`address-flow-time-series` / `TxIndexer.address_flow_time_series(filters, start_time, end_time, bucket, page_size=100, cursor=None)`：沿用 query 全部筛选取交集，必填观察地址 address（缺失报 `invalid_flow_series_filter`，与 from/to 并用仍报 `invalid_filter`），必填左闭右开时间窗与 hour/day 桶粒度，窗内命中交易按纪元对齐到全部连续桶（首桶纪元对齐可早于 start-time、末桶只计 end-time 前数据），相对观察地址拆分 sent/received：发送方计 sent_count/sent_amount、接收方计 received_count/received_amount，自转账两侧累计但 total_count 一次，每点返回 bucket_start/sent_count/received_count/total_count/sent_amount/received_amount/net_amount，金额为无前导零十进制字符串、net_amount = received - sent 可带负号、零为 `"0"`，按 bucket_start 升序，空桶零值填充、无命中时返回等长零值序列，返回 total_points/total_buckets（二者相同）；游标绑定命令、观察地址、等价筛选、时间窗与桶粒度、不绑 page-size，末页之后为空页与空游标，篡改/解码失败/跨命令复用/改变条件报 `invalid_flow_series_cursor`，时间范围缺失/非法/为负/倒置报 `invalid_flow_series_range`、桶粒度缺失/非法报 `unsupported_flow_series_bucket`、page_size 非法报 `invalid_page_size`，全部先于分页数据抛出，通用筛选与数据文件错误沿用既有错误码，既有命令行为不变）；区块高度筛选（`--min-block` / `--max-block` 与 `normalize_filters(min_block=…, max_block=…)`：含端点的非负整数闭区间，可单独提供并与既有筛选取交集，query/stats/六类分组统计全部基于命中交易重算 `total` / `total_count` / `total_groups`；非法边界报 `invalid_block_filter`、区间倒置报 `invalid_block_range`，均在读取数据文件前抛出；游标按数值等价绑定区块边界，仅前导零不同仍同条件，不携带边界字段的旧游标仅在未指定边界时可续翻；time-bucket-aggregation 与导入、替换、回放入口不变）；记录级成功状态与状态筛选（JSON Lines 新增可选 `success` 布尔字段：只能为 `true`/`false`、缺省 `true`，`0`/`1`/字符串/`null` 报 `invalid_transaction` 并保留物理行号，既有字段与 `amount` 格式不变、其他额外字段仍非法；全部查询统计入口可选 `--status success|failure`，大小写敏感、缺省不筛、与既有筛选取交集，空/空白/大小写变体/非 success/failure/非字符串在读数据前报 `invalid_status_filter`；`status` 绑定分页游标，改状态复用旧游标报 `invalid_cursor`，未携带 status 的旧游标仅在未指定状态时可续翻；新入口 `status-stats` 无游标返回 `total_count`/`success_count`/`failure_count`/`success_amount`/`failure_amount`，金额为十进制整数字符串，空结果全 0、指定状态时另一状态全 0；query 排序/total/统计结构/total_groups/左闭右闭时间窗、time-bucket-aggregation 左闭右开连续桶/空桶/错误优先级、导入替换回放均不变）；可重放的分批增量导入与链分叉修正（`tx_indexer.fork.ForkAwareImporter` / `ForkCorrectingImporter`：批次携带来源链标识、批次序号、父区块哈希、区块哈希、区块高度与沿用公开记录语义的交易列表，父区块哈希必须等于引擎当前末端区块哈希否则抛 `BlockLinkMismatchError` 且数据不变，相同来源链标识/区块哈希/批次序号的批次重复提交返回 `already_applied` 不重复写入不重复累计；`apply_branch`（别名 `replace_branch`）用更高高度的新分支取代从分叉点开始的旧分支，先撤销被替代区块的地址/方法/时间窗索引与聚合贡献再按高度顺序应用新分支，回滚期间相同交易哈希按当前分支内去重，返回 `rolled_back_block_count` / `applied_block_count` / `tip_block_hash` 等确定结果；来源链标识为空、区块高度为负、批次序号非正或批次内重复区块哈希抛 `InvalidImportBatchError` 且数据不变；分叉修正后所有查询只反映当前有效分支、聚合与明细过滤一致，指向已回滚交易的旧游标抛 `CursorOutOfRangeError`，时间边界、空结果、排序与游标稳定性等既有语义不变）。

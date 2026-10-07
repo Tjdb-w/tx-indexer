@@ -6,10 +6,13 @@
 - loader：JSON Lines 加载与校验
 - importer：增量交易导入与断点续传
 - replay：索引水位与幂等重放
+- fork：可重放的分批增量导入与链分叉修正
 - cli：命令行入口（tx-indexer query / stats / method-stats）
 """
 
 from .errors import (
+    BlockLinkMismatchError,
+    CursorOutOfRangeError,
     DuplicateTransactionError,
     InvalidAggregationCursor,
     InvalidAggregationCursorError,
@@ -23,6 +26,7 @@ from .errors import (
     InvalidBlockRangeError,
     InvalidCursorError,
     InvalidFilterError,
+    InvalidImportBatchError,
     InvalidPageSizeError,
     InvalidStatusFilterError,
     InvalidTimeRangeError,
@@ -32,6 +36,7 @@ from .errors import (
     UnsupportedAggregationBucket,
     UnsupportedAggregationBucketError,
 )
+from .fork import ForkAwareImporter, ForkCorrectingImporter
 from .importer import (
     BLOCK_CONFLICT,
     IMPORT_CURSOR_MISMATCH,
@@ -44,7 +49,11 @@ from .replay import MultiChainReplayManager, ReplayManager
 
 __all__ = [
     "BLOCK_CONFLICT",
+    "BlockLinkMismatchError",
+    "CursorOutOfRangeError",
     "DuplicateTransactionError",
+    "ForkAwareImporter",
+    "ForkCorrectingImporter",
     "IMPORT_CURSOR_MISMATCH",
     "INVALID_IMPORT_BATCH",
     "INVALID_REPLACEMENT_BATCH",
@@ -61,6 +70,7 @@ __all__ = [
     "InvalidBlockRangeError",
     "InvalidCursorError",
     "InvalidFilterError",
+    "InvalidImportBatchError",
     "InvalidPageSizeError",
     "InvalidStatusFilterError",
     "InvalidTimeRangeError",

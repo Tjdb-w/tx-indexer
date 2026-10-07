@@ -111,6 +111,29 @@ class TransactionConflictError(TxIndexerError):
     error = "transaction_conflict"
 
 
+class InvalidImportBatchError(TxIndexerError):
+    """导入批次结构非法：来源链标识为空、区块高度为负、批次序号非正数、
+    批次内出现重复区块哈希，或批次/交易字段类型非法。抛出时不改变任何
+    现有数据。"""
+
+    error = "invalid_import_batch"
+
+
+class BlockLinkMismatchError(TxIndexerError):
+    """批次父区块哈希与引擎当前末端区块哈希不一致（含来源链标识不符、
+    区块高度无法衔接、新分支末端不高于当前末端），批次无法链接到当前
+    分支。抛出时索引、统计与查询结果保持导入前状态。"""
+
+    error = "block_link_mismatch"
+
+
+class CursorOutOfRangeError(TxIndexerError):
+    """分页游标指向的交易已不在当前有效分支上（已被链分叉修正回滚）。
+    不返回旧分支数据。"""
+
+    error = "cursor_out_of_range"
+
+
 class InvalidAggregationRange(TxIndexerError):
     """时间分桶聚合的时间范围非法：start_time/end_time 缺失或倒置。"""
 
