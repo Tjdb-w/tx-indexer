@@ -12,6 +12,7 @@
     tx-indexer method-status-stats <data.jsonl> [筛选与分页选项]
     tx-indexer address-stats <data.jsonl> [筛选与分页选项]
     tx-indexer address-flow-stats <data.jsonl> [筛选与分页选项]
+    tx-indexer address-method-stats <data.jsonl> [筛选与分页选项]
     tx-indexer counterparty-stats <data.jsonl> --address ADDR [筛选与分页选项]
     tx-indexer time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
     tx-indexer pair-stats <data.jsonl> [筛选与分页选项]
@@ -250,6 +251,24 @@ def build_parser():
         "--cursor", help="上一页返回的 next_cursor"
     )
 
+    address_method_stats_parser = subparsers.add_parser(
+        "address-method-stats",
+        help="按参与地址 × method 交叉分页汇总"
+             "（返回 groups/total_groups/next_cursor）",
+    )
+    address_method_stats_parser.add_argument(
+        "file", help="JSON Lines 数据文件路径"
+    )
+    _add_filter_args(address_method_stats_parser)
+    address_method_stats_parser.add_argument(
+        "--page-size",
+        default=str(DEFAULT_PAGE_SIZE),
+        help="每页分组数，1 到 1000，默认 100",
+    )
+    address_method_stats_parser.add_argument(
+        "--cursor", help="上一页返回的 next_cursor"
+    )
+
     counterparty_stats_parser = subparsers.add_parser(
         "counterparty-stats",
         help="按交易对手分页汇总（返回 address/groups/total_groups/next_cursor）",
@@ -485,6 +504,7 @@ def main(argv=None):
                 "method-status-stats",
                 "address-stats",
                 "address-flow-stats",
+                "address-method-stats",
                 "counterparty-stats",
                 "time-stats",
                 "pair-stats",
@@ -528,6 +548,10 @@ def main(argv=None):
                 )
             elif args.command == "address-flow-stats":
                 result = indexer.address_flow_stats(
+                    filters, page_size=page_size, cursor=args.cursor
+                )
+            elif args.command == "address-method-stats":
+                result = indexer.address_method_stats(
                     filters, page_size=page_size, cursor=args.cursor
                 )
             elif args.command == "counterparty-stats":

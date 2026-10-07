@@ -59,6 +59,8 @@ SCOPE_ADDRESS_TIME_STATS = "address-time-stats"
 SCOPE_METHOD_TIME_STATS = "method-time-stats"
 #: 地址资金流向统计（sent/received/net 拆分）的作用域标识
 SCOPE_ADDRESS_FLOW_STATS = "address-flow-stats"
+#: 地址 × method 交叉统计的作用域标识
+SCOPE_ADDRESS_METHOD_STATS = "address-method-stats"
 #: 时间分桶聚合（连续 hour/day 桶、含空桶）的作用域标识
 SCOPE_TIME_BUCKET_AGGREGATION = "time-bucket-aggregation"
 #: 增量导入游标的作用域标识（与所有分页游标相互独立，不能混用）
@@ -729,6 +731,64 @@ def decode_address_flow_stats_cursor(token, filters):
         raise InvalidCursorError("游标位置信息非法", None)
 
     return after[0], after[1], after[2], after[3], after[4]
+
+
+def encode_address_method_stats_cursor(filters, after_total_amount,
+                                       after_total_count, after_send_count,
+                                       after_receive_count, after_address,
+                                       after_method):
+    """address-method-stats 游标：绑定命令与等价筛选（含 status、金额与
+    区块数值边界），不绑定 page_size。marker 为上一页最后一组的完整
+    排序键 (total_amount, total_count, send_count, receive_count,
+    address, method)。"""
+    payload = {
+        "v": _CURSOR_VERSION,
+        "c": SCOPE_ADDRESS_METHOD_STATS,
+        "f": _canonical_filters(filters),
+        "after": [
+            after_total_amount,
+            after_total_count,
+            after_send_count,
+            after_receive_count,
+            after_address,
+            after_method,
+        ],
+    }
+    return _encode_payload(payload)
+
+
+def decode_address_method_stats_cursor(token, filters):
+    """解码并校验 address-method-stats 游标。
+
+    返回 exclusive marker ``(total_amount, total_count, send_count,
+    receive_count, address, method)``。
+    """
+    payload = _decode_payload(token, filters, SCOPE_ADDRESS_METHOD_STATS)
+
+    after = payload.get("after")
+    if (
+        not isinstance(after, list)
+        or len(after) != 6
+        or not isinstance(after[0], int)
+        or isinstance(after[0], bool)
+        or after[0] < 0
+        or not isinstance(after[1], int)
+        or isinstance(after[1], bool)
+        or after[1] < 1
+        or not isinstance(after[2], int)
+        or isinstance(after[2], bool)
+        or after[2] < 0
+        or not isinstance(after[3], int)
+        or isinstance(after[3], bool)
+        or after[3] < 0
+        or not isinstance(after[4], str)
+        or after[4] == ""
+        or not isinstance(after[5], str)
+        or after[5] == ""
+    ):
+        raise InvalidCursorError("游标位置信息非法", None)
+
+    return after[0], after[1], after[2], after[3], after[4], after[5]
 
 
 #: 时间分桶聚合支持的桶粒度及其桶宽（UTC 秒）
