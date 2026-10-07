@@ -29,6 +29,12 @@ status 字段的旧游标只在本次未指定状态时可续翻。
 完整查询条件（address、method、起止时间）与桶粒度（hour/day），
 解码失败或条件不一致抛 InvalidAggregationCursor，与其余分页游标
 （InvalidCursorError）相互独立、不能跨命令复用。
+
+method-time-series 游标（scope ``method-time-series``）绑定等价筛选
+（与 query 相同的筛选快照）、左闭右开时间窗（start_time/end_time）与
+桶粒度（hour/day），不绑定 page_size；格式错误、被篡改、跨命令复用
+或任一绑定条件变化都抛 InvalidSeriesCursorError，与上述各类游标
+相互独立。
 """
 
 import base64
@@ -38,6 +44,7 @@ import json
 from .errors import (
     InvalidAggregationCursor,
     InvalidCursorError,
+    InvalidSeriesCursorError,
 )
 from .loader import _AMOUNT_RE
 
@@ -63,6 +70,8 @@ SCOPE_METHOD_TIME_STATS = "method-time-stats"
 SCOPE_ADDRESS_FLOW_STATS = "address-flow-stats"
 #: 时间分桶聚合（连续 hour/day 桶、含空桶）的作用域标识
 SCOPE_TIME_BUCKET_AGGREGATION = "time-bucket-aggregation"
+#: method 时间序列（连续 hour/day 桶 × method，含空桶）的作用域标识
+SCOPE_METHOD_TIME_SERIES = "method-time-series"
 #: 增量导入游标的作用域标识（与所有分页游标相互独立，不能混用）
 SCOPE_IMPORT = "import"
 
@@ -905,3 +914,84 @@ def decode_time_bucket_aggregation_cursor(token, filters, granularity):
         # 时间分桶聚合对外统一使用独立的聚合游标错误类型，不复用
         # invalid_cursor，避免与既有命令的错误语义混淆
         raise InvalidAggregationCursor(exc.message, None) from exc
+
+
+def encode_method_time_series_cursor(filters, start_time, end_time, bucket,
+                                     after_bucket_start, after_method):
+    """method-time-series 游标：绑定等价筛选（与 query 相同的筛选快照）、
+    左闭右开时间窗与桶粒度，不绑定 page_size。marker 为上一页最后一个
+    序列点的 ``(bucket_start, method)``。"""
+    payload = {
+        "v": _CURSOR_VERSION,
+        "c": SCOPE_METHOD_TIME_SERIES,
+        "f": _canonical_filters(filters),
+        "w": [start_time, end_time],
+        "g": bucket,
+        "after": [after_bucket_start, after_method],
+    }
+    return _encode_payload(payload)
+
+
+def decode_method_time_series_cursor(token, filters, start_time, end_time,
+                                     bucket):
+    """解码并校验 method-time-series 游标。
+
+    返回 exclusive marker ``(bucket_start, method)``。游标格式错误、
+    无法解码、被篡改、作用域不符（跨命令复用），或筛选、时间窗、桶粒度
+    与当前请求不一致时，都抛 InvalidSeriesCursorError，绝不返回部分
+    分页数据。
+    """
+    try:
+        payload = _decode_payload(token, filters, SCOPE_METHOD_TIME_SERIES)
+
+        saved_window = payload.get("w")
+        if (
+            not isinstance(saved_window, list)
+            or len(saved_window) != 2
+            or any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                for value in saved_window
+            )
+        ):
+            raise InvalidCursorError("游标时间窗信息非法", None)
+        if saved_window[0] != start_time or saved_window[1] != end_time:
+            raise InvalidCursorError("游标与当前时间窗不匹配", None)
+
+        saved_bucket = payload.get("g")
+        if saved_bucket not in AGGREGATION_GRANULARITIES:
+            raise InvalidCursorError("游标桶粒度非法", None)
+        if saved_bucket != bucket:
+            raise InvalidCursorError("游标与当前桶粒度不匹配", None)
+
+        after = payload.get("after")
+        if (
+            not isinstance(after, list)
+            or len(after) != 2
+            or not isinstance(after[0], int)
+            or isinstance(after[0], bool)
+            or after[0] < 0
+            or not isinstance(after[1], str)
+            or after[1] == ""
+        ):
+            raise InvalidCursorError("游标位置信息非法", None)
+
+        # marker 的 bucket_start 必须是当前时间窗内一个实际返回桶的起点：
+        # 桶按纪元 3600/86400 秒对齐，首桶可早于 start_time、末桶只覆盖
+        # end_time 之前的数据。错位或越界的篡改值在此被拒绝。
+        width = AGGREGATION_GRANULARITIES[saved_bucket]
+        first_start = (start_time // width) * width
+        last_start = ((end_time - 1) // width) * width
+        if (
+            after[0] % width != 0
+            or after[0] < first_start
+            or after[0] > last_start
+        ):
+            raise InvalidCursorError("游标位置不在合法桶边界上", None)
+
+        return after[0], after[1]
+    except InvalidCursorError as exc:
+        # method-time-series 对外统一使用独立的序列游标错误类型，不复用
+        # invalid_cursor / invalid_aggregation_cursor
+        raise InvalidSeriesCursorError(exc.message, None) from exc

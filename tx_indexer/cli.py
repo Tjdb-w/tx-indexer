@@ -3,7 +3,7 @@
 ``address-stats`` / ``address-method-stats`` /
 ``address-flow-stats`` / ``counterparty-stats`` /
 ``time-stats`` / ``pair-stats`` / ``address-time-stats`` /
-``time-bucket-aggregation``。
+``time-bucket-aggregation`` / ``method-time-series``。
 
 用法：
     tx-indexer query <data.jsonl> [筛选与分页选项]
@@ -20,6 +20,7 @@
     tx-indexer address-time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
     tx-indexer method-time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
     tx-indexer time-bucket-aggregation <data.jsonl> --start-time TS --end-time TS --bucket hour|day [选项]
+    tx-indexer method-time-series <data.jsonl> --start-time TS --end-time TS --bucket hour|day [筛选与分页选项]
 
 领域错误（invalid_transaction / duplicate_transaction / invalid_time_range /
 invalid_page_size / invalid_cursor / invalid_filter / invalid_status_filter /
@@ -27,7 +28,8 @@ invalid_bucket_size /
 invalid_amount_filter / invalid_amount_range / invalid_block_filter /
 invalid_block_range / invalid_aggregation_range /
 unsupported_aggregation_bucket / invalid_aggregation_filter /
-invalid_aggregation_cursor）
+invalid_aggregation_cursor / invalid_series_range /
+unsupported_series_bucket / invalid_series_cursor）
 以 JSON 对象输出到 stderr，退出码 2：
 
     {"error": "...", "message": "...", "input_line": 12}
@@ -41,6 +43,7 @@ from .engine import (
     DEFAULT_PAGE_SIZE,
     TxIndexer,
     normalize_filters,
+    validate_method_time_series_params,
     validate_time_bucket_aggregation_params,
 )
 from .errors import (
@@ -50,8 +53,10 @@ from .errors import (
     InvalidBucketSizeError,
     InvalidFilterError,
     InvalidPageSizeError,
+    InvalidSeriesRangeError,
     TxIndexerError,
     UnsupportedAggregationBucket,
+    UnsupportedSeriesBucketError,
 )
 from .loader import _AMOUNT_RE, load_file
 
@@ -401,18 +406,50 @@ def build_parser():
         "--cursor", help="上一页返回的 next_cursor"
     )
 
+    method_time_series_parser = subparsers.add_parser(
+        "method-time-series",
+        help="按 hour/day 连续分桶 × method 的时间序列"
+             "（返回 series/total_points/total_methods/total_buckets，"
+             "含空桶）",
+    )
+    method_time_series_parser.add_argument(
+        "file", help="JSON Lines 数据文件路径"
+    )
+    _add_filter_args(method_time_series_parser)
+    # 本命令的 --start-time/--end-time 是必填的左闭右开序列时间窗，
+    # 不作为通用筛选的左闭右闭时间窗解析
+    for action in method_time_series_parser._actions:
+        if action.dest == "start_time":
+            action.help = "序列时间窗起点（UTC 秒，含）；必填，非负整数"
+        elif action.dest == "end_time":
+            action.help = (
+                "序列时间窗终点（UTC 秒，不含）；必填，非负整数且晚于起点"
+            )
+    method_time_series_parser.add_argument(
+        "--bucket",
+        help="桶粒度：hour（整点小时）或 day（UTC 自然日）；必填",
+    )
+    method_time_series_parser.add_argument(
+        "--page-size",
+        default=str(DEFAULT_PAGE_SIZE),
+        help="每页序列点数，1 到 1000，默认 100",
+    )
+    method_time_series_parser.add_argument(
+        "--cursor", help="上一页返回的 next_cursor"
+    )
+
     return parser
 
 
-def _filters_from_args(args, parser):
+def _filters_from_args(args, parser, with_time=True):
     start_time = (
         _parse_time(args.start_time, "--start-time", parser)
-        if args.start_time is not None
+        if with_time and args.start_time is not None
         else None
     )
     end_time = (
         _parse_time(args.end_time, "--end-time", parser)
-        if args.end_time is not None
+        if with_time and args.end_time is not None
         else None
     )
     # 倒置校验集中在 normalize_filters，抛 InvalidTimeRangeError；
@@ -493,6 +530,48 @@ def main(argv=None):
                 args.bucket,
                 address=args.address,
                 method=agg_method,
+                page_size=page_size,
+                cursor=args.cursor,
+            )
+        elif args.command == "method-time-series":
+            # 独立的 method 时间序列入口：沿用 query 的全部筛选（左闭右开
+            # 的必填序列时间窗除外，通用筛选时间窗不参与本命令）。范围、
+            # 桶粒度与筛选值的校验全部在读取数据文件前完成。
+            if args.start_time is None or args.end_time is None:
+                raise InvalidSeriesRangeError(
+                    "method-time-series 必须指定 --start-time 与"
+                    " --end-time（UTC 秒，左闭右开）",
+                    None,
+                )
+            try:
+                series_start = int(args.start_time)
+                series_end = int(args.end_time)
+            except (TypeError, ValueError):
+                raise InvalidSeriesRangeError(
+                    "--start-time 与 --end-time 必须为非负 UTC 秒整数",
+                    None,
+                )
+            if args.bucket is None:
+                raise UnsupportedSeriesBucketError(
+                    "method-time-series 必须指定 --bucket hour|day",
+                    None,
+                )
+            # 通用筛选沿用 query 语义与既有错误（空白、冲突、金额与区块
+            # 边界、status 等都在读取数据文件前抛出）
+            filters = _filters_from_args(args, parser, with_time=False)
+            # 范围倒置/负值与桶粒度取值也在读取数据文件前校验
+            validate_method_time_series_params(
+                series_start, series_end, args.bucket
+            )
+            page_size = _parse_page_size(args.page_size)
+
+            records = load_file(args.file)
+            indexer = TxIndexer(records)
+            result = indexer.method_time_series(
+                filters,
+                series_start,
+                series_end,
+                args.bucket,
                 page_size=page_size,
                 cursor=args.cursor,
             )

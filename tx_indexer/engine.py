@@ -58,6 +58,13 @@ time-bucket-aggregation 是与上述入口相互独立的时间分桶聚合：�
 按桶起点升序返回连续桶（含无交易的零计数桶），每桶含
 total_count、success_count、failure_count，游标绑定完整查询条件与
 桶粒度，错误使用独立的 InvalidAggregation* 异常类型。
+method-time-series 在同样的左闭右开必填时间窗与 hour/day 桶粒度下，
+沿用 query 的全部筛选，把窗内命中交易按 method 原字符串分组：每个
+入选 method 覆盖范围内全部连续桶（空桶计数为 0、金额为 "0"），
+每点含 method、bucket_start、total_count、total_amount、
+success_count、failure_count，按 bucket_start 升序、同桶 method
+码点升序分页；游标绑定等价筛选、时间窗与桶粒度，错误使用独立的
+InvalidSeries*Error 异常类型。
 分页：不透明 keyset 游标（见 :mod:`tx_indexer.cursor`），相同命令与
 筛选下不跳过、不重复、不乱序；``total`` / ``total_groups`` 始终为
 全部匹配数 / 全部分组数。
@@ -74,6 +81,7 @@ from .cursor import (
     decode_cursor,
     decode_method_stats_cursor,
     decode_method_status_stats_cursor,
+    decode_method_time_series_cursor,
     decode_method_time_stats_cursor,
     decode_pair_stats_cursor,
     decode_time_bucket_aggregation_cursor,
@@ -86,6 +94,7 @@ from .cursor import (
     encode_cursor,
     encode_method_stats_cursor,
     encode_method_status_stats_cursor,
+    encode_method_time_series_cursor,
     encode_method_time_stats_cursor,
     encode_pair_stats_cursor,
     encode_time_bucket_aggregation_cursor,
@@ -101,9 +110,11 @@ from .errors import (
     InvalidBucketSizeError,
     InvalidFilterError,
     InvalidPageSizeError,
+    InvalidSeriesRangeError,
     InvalidStatusFilterError,
     InvalidTimeRangeError,
     UnsupportedAggregationBucket,
+    UnsupportedSeriesBucketError,
 )
 from .loader import _AMOUNT_RE
 
@@ -382,6 +393,43 @@ def validate_time_bucket_aggregation_params(start_time, end_time, bucket,
         raise InvalidAggregationFilter(message, None) from exc
 
     return method_set, width
+
+
+def validate_method_time_series_params(start_time, end_time, bucket):
+    """method-time-series 的时间窗与桶粒度校验（不依赖数据，可在读取
+    数据文件前执行）。
+
+    返回桶宽（UTC 秒）。时间范围缺失、类型非法、为负或
+    ``end_time <= start_time`` 抛 InvalidSeriesRangeError；桶粒度缺失、
+    类型非法或不是 hour/day 抛 UnsupportedSeriesBucketError。筛选值
+    沿用 query 语义，由 normalize_filters 在校验前先行归一化。
+    """
+    # 1. 时间范围：必填、非负 UTC 秒整数、左闭右开且非空
+    if (
+        not isinstance(start_time, int)
+        or isinstance(start_time, bool)
+        or not isinstance(end_time, int)
+        or isinstance(end_time, bool)
+        or start_time < 0
+        or end_time < 0
+        or end_time <= start_time
+    ):
+        raise InvalidSeriesRangeError(
+            "method-time-series 要求 start_time、end_time 为非负 UTC 秒"
+            "整数，且 end_time 严格大于 start_time（左闭右开）",
+            None,
+        )
+
+    # 2. 桶粒度：只支持小时与 UTC 自然日
+    if not isinstance(bucket, str) or (
+        bucket not in _AGGREGATION_GRANULARITY_SECONDS
+    ):
+        raise UnsupportedSeriesBucketError(
+            "method-time-series 的桶粒度必须是 hour 或 day，收到：%r"
+            % (bucket,),
+            None,
+        )
+    return _AGGREGATION_GRANULARITY_SECONDS[bucket]
 
 
 class TxIndexer:
@@ -1838,6 +1886,146 @@ class TxIndexer:
 
         return {
             "buckets": buckets,
+            "total_buckets": total_buckets,
+            "next_cursor": next_cursor,
+        }
+
+    def method_time_series(self, filters, start_time, end_time, bucket,
+                           page_size=DEFAULT_PAGE_SIZE, cursor=None):
+        """按 hour/day 连续分桶 × method 的时间序列分页统计。
+
+        沿用 query 的全部筛选（``filters`` 由 :func:`normalize_filters`
+        构造，各条件取交集），在此之上叠加必填的左闭右开时间窗
+        ``[start_time, end_time)``（UTC 秒）与必填桶粒度 ``bucket``
+        （``"hour"`` 按整点、``"day"`` 按 UTC 自然日，桶宽 3600/86400
+        秒、从 Unix 纪元对齐）。窗内命中交易的 method 原字符串即为入选
+        method；每个入选 method 覆盖范围内**全部连续桶**——首桶按纪元
+        对齐（可早于 start_time），末桶只覆盖 end_time 之前的数据，
+        该 method 在某桶无交易时计数为 0、金额为 ``"0"``，不静默跳过。
+
+        返回 ``{series, total_points, total_methods, total_buckets,
+        next_cursor}``：``series`` 每项含 ``method``、``bucket_start``、
+        ``total_count``、``total_amount``（无前导零十进制字符串）、
+        ``success_count``、``failure_count``（记录未携带 success 计
+        成功），按 ``bucket_start`` 升序、同桶 ``method`` 的 Unicode
+        码点升序排列；``total_points = total_methods × total_buckets``
+        （均为全部结果数而非当前页数）。窗内无命中交易时 ``series``
+        为空、``total_methods`` 与 ``total_points`` 为 0。
+
+        确定性错误（均在返回任何分页数据之前抛出）：
+
+        - 起止时间缺失、类型非法、为负或 ``end_time <= start_time`` →
+          InvalidSeriesRangeError
+        - 桶粒度缺失、类型非法或不是 hour/day →
+          UnsupportedSeriesBucketError
+        - page_size 非法 → InvalidPageSizeError
+        - 游标格式错误、被篡改、跨命令复用，或筛选、时间窗、桶粒度与
+          签发时不一致 → InvalidSeriesCursorError
+
+        游标绑定等价筛选（含 status、金额与区块数值边界）、时间窗与
+        桶粒度，不绑定 page_size；相同条件下翻页不重复、不遗漏。末页
+        之后再翻页返回空 ``series`` 与 ``next_cursor=None``。
+        """
+        width = validate_method_time_series_params(
+            start_time, end_time, bucket
+        )
+        self._validate_page_size(page_size)
+
+        # 连续桶边界：首桶按纪元整点/整日对齐（可早于 start_time），
+        # 末桶为覆盖 end_time - 1 的那个桶
+        first_start = (start_time // width) * width
+        last_start = ((end_time - 1) // width) * width
+        total_buckets = (last_start - first_start) // width + 1
+
+        # key = (bucket_start, method)，值 = [count, amount, success, failure]
+        stats = {}
+        methods = set()
+        for record in self._records:
+            ts = record["timestamp"]
+            if ts < start_time or ts >= end_time:
+                continue
+            if not _matches(record, filters):
+                continue
+            method = record["method"]
+            methods.add(method)
+            key = ((ts // width) * width, method)
+            slot = stats.get(key)
+            if slot is None:
+                slot = [0, 0, 0, 0]
+                stats[key] = slot
+            slot[0] += 1
+            slot[1] += int(record["amount"])
+            if record.get("success", True):
+                slot[2] += 1
+            else:
+                slot[3] += 1
+
+        # 入选 method 取窗内原字符串，按 Unicode 码点升序；序列按
+        # (bucket_start 升序, method 码点升序) 展开为连续点
+        method_list = sorted(methods)
+        total_methods = len(method_list)
+        total_points = total_methods * total_buckets
+
+        # 游标解码（绑定等价筛选、时间窗与桶粒度）：keyset 续页，
+        # marker 为上一页最后一点，严格从下一点开始
+        if cursor is not None:
+            (
+                after_bucket_start,
+                after_method,
+            ) = decode_method_time_series_cursor(
+                cursor, filters, start_time, end_time, bucket
+            )
+            bucket_index = (after_bucket_start - first_start) // width
+            method_index = bisect.bisect_left(method_list, after_method)
+            if (
+                method_index < total_methods
+                and method_list[method_index] == after_method
+            ):
+                # marker 命中现存点本身：从其下一点开始
+                method_index += 1
+            start_flat = bucket_index * total_methods + method_index
+        else:
+            start_flat = 0
+
+        end_flat = start_flat + page_size
+        page_end = min(end_flat, total_points)
+        series = []
+        for flat in range(start_flat, page_end):
+            bucket_index, method_index = divmod(flat, total_methods)
+            bucket_start = first_start + bucket_index * width
+            method = method_list[method_index]
+            (
+                total_count,
+                total_amount,
+                success_count,
+                failure_count,
+            ) = stats.get((bucket_start, method), (0, 0, 0, 0))
+            series.append({
+                "method": method,
+                "bucket_start": bucket_start,
+                "total_count": total_count,
+                "total_amount": str(total_amount),
+                "success_count": success_count,
+                "failure_count": failure_count,
+            })
+
+        if end_flat < total_points:
+            last = series[-1]
+            next_cursor = encode_method_time_series_cursor(
+                filters,
+                start_time,
+                end_time,
+                bucket,
+                last["bucket_start"],
+                last["method"],
+            )
+        else:
+            next_cursor = None
+
+        return {
+            "series": series,
+            "total_points": total_points,
+            "total_methods": total_methods,
             "total_buckets": total_buckets,
             "next_cursor": next_cursor,
         }
