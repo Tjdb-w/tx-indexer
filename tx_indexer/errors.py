@@ -160,3 +160,29 @@ class InvalidSeriesCursorError(TxIndexerError):
     或与当前筛选、时间窗、桶粒度不一致。"""
 
     error = "invalid_series_cursor"
+
+
+class InvalidFlowSeriesFilterError(TxIndexerError):
+    """address-flow-time-series 的观察地址缺失、为空白或类型非法。"""
+
+    error = "invalid_flow_series_filter"
+
+
+class InvalidFlowSeriesRangeError(TxIndexerError):
+    """address-flow-time-series 时间范围非法：start_time/end_time 缺失、
+    类型非法、为负，或 end_time 不大于 start_time（左闭右开）。"""
+
+    error = "invalid_flow_series_range"
+
+
+class UnsupportedFlowSeriesBucketError(TxIndexerError):
+    """address-flow-time-series 的桶粒度缺失、类型非法或不是 hour / day。"""
+
+    error = "unsupported_flow_series_bucket"
+
+
+class InvalidFlowSeriesCursorError(TxIndexerError):
+    """address-flow-time-series 游标格式错误、无法解码、被篡改、跨命令
+    复用，或与当前地址、筛选、时间窗、桶粒度不一致。"""
+
+    error = "invalid_flow_series_cursor"
