@@ -16,6 +16,7 @@
     tx-indexer time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
     tx-indexer pair-stats <data.jsonl> [筛选与分页选项]
     tx-indexer address-time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
+    tx-indexer method-time-stats <data.jsonl> --bucket-size SECONDS [筛选与分页选项]
     tx-indexer time-bucket-aggregation <data.jsonl> --start-time TS --end-time TS --bucket hour|day [选项]
 
 领域错误（invalid_transaction / duplicate_transaction / invalid_time_range /
@@ -320,6 +321,28 @@ def build_parser():
         "--cursor", help="上一页返回的 next_cursor"
     )
 
+    method_time_stats_parser = subparsers.add_parser(
+        "method-time-stats",
+        help="按时间区间 × method 联合分页汇总"
+             "（返回 groups/total_groups/next_cursor）",
+    )
+    method_time_stats_parser.add_argument(
+        "file", help="JSON Lines 数据文件路径"
+    )
+    _add_filter_args(method_time_stats_parser)
+    method_time_stats_parser.add_argument(
+        "--bucket-size",
+        help="区间宽度（秒），大于 0 的整数；区间从 Unix 纪元对齐、左闭右开",
+    )
+    method_time_stats_parser.add_argument(
+        "--page-size",
+        default=str(DEFAULT_PAGE_SIZE),
+        help="每页分组数，1 到 1000，默认 100",
+    )
+    method_time_stats_parser.add_argument(
+        "--cursor", help="上一页返回的 next_cursor"
+    )
+
     time_bucket_parser = subparsers.add_parser(
         "time-bucket-aggregation",
         help="按小时/自然日连续分桶聚合"
@@ -466,10 +489,15 @@ def main(argv=None):
                 "time-stats",
                 "pair-stats",
                 "address-time-stats",
+                "method-time-stats",
             ):
                 page_size = _parse_page_size(args.page_size)
             bucket_size = None
-            if args.command in ("time-stats", "address-time-stats"):
+            if args.command in (
+                "time-stats",
+                "address-time-stats",
+                "method-time-stats",
+            ):
                 # 缺失、非整数或不大于 0 都在读取数据文件前报 invalid_bucket_size
                 bucket_size = _parse_bucket_size(args.bucket_size)
             if args.command == "counterparty-stats" and filters["address"] is None:
@@ -516,6 +544,10 @@ def main(argv=None):
                 )
             elif args.command == "address-time-stats":
                 result = indexer.address_time_stats(
+                    filters, bucket_size, page_size=page_size, cursor=args.cursor
+                )
+            elif args.command == "method-time-stats":
+                result = indexer.method_time_stats(
                     filters, bucket_size, page_size=page_size, cursor=args.cursor
                 )
             elif args.command == "status-stats":

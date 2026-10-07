@@ -41,6 +41,12 @@ address-time-stats 先按从 Unix 纪元对齐、左闭右开的固定宽度时�
 返回非空（区间, 地址）组，顺序为 bucket_start 升序、total_amount
 降序、total_count 降序、send_count 降序、receive_count 降序、
 address 码点升序。
+method-time-stats 先按同样的固定宽度时间区间分桶，再在区间内按
+method 原字符串聚合，只返回非空（区间, method）组，每组返回
+bucket_start、method、total_count、total_amount、success_count、
+failure_count（未携带 success 计成功），顺序为 bucket_start 升序、
+total_amount 降序、total_count 降序、success_count 降序、
+failure_count 降序、method 码点升序。
 time-bucket-aggregation 是与上述入口相互独立的时间分桶聚合：必填
 左闭右开时间窗（UTC 秒）与 hour/day 桶粒度，可选 address/method；
 按桶起点升序返回连续桶（含无交易的零计数桶），每桶含
@@ -61,6 +67,7 @@ from .cursor import (
     decode_cursor,
     decode_method_stats_cursor,
     decode_method_status_stats_cursor,
+    decode_method_time_stats_cursor,
     decode_pair_stats_cursor,
     decode_time_bucket_aggregation_cursor,
     decode_time_stats_cursor,
@@ -71,6 +78,7 @@ from .cursor import (
     encode_cursor,
     encode_method_stats_cursor,
     encode_method_status_stats_cursor,
+    encode_method_time_stats_cursor,
     encode_pair_stats_cursor,
     encode_time_bucket_aggregation_cursor,
     encode_time_stats_cursor,
@@ -1402,6 +1410,133 @@ class TxIndexer:
                 send_counts[last_key],
                 receive_counts[last_key],
                 last_address,
+            )
+        else:
+            next_cursor = None
+
+        return {
+            "groups": groups,
+            "total_groups": total_groups,
+            "next_cursor": next_cursor,
+        }
+
+    def method_time_stats(self, filters, bucket_size,
+                          page_size=DEFAULT_PAGE_SIZE, cursor=None):
+        """按时间区间 × method 联合分组的分页统计。
+
+        匹配交易先按从 Unix 纪元对齐、左闭右开的固定宽度时间区间分桶：
+        ``bucket_start = (timestamp // bucket_size) * bucket_size``；每笔
+        匹配交易恰好进入一个区间，再在区间内按 method 原字符串分组，只
+        返回非空（区间, method）组。记录未携带 success（如回放标准化记录）
+        时按成功处理；指定 ``status=success`` / ``failure`` 时，另一状态
+        的计数恒为 0。
+
+        返回 {groups, total_groups, next_cursor}；每组含 bucket_start、
+        method、total_count、total_amount（无前导零十进制整数字符串）、
+        success_count、failure_count。顺序：bucket_start 升序，同桶内
+        total_amount 数值降序、total_count 降序、success_count 降序、
+        failure_count 降序、method 的 Unicode 码点升序。游标绑定本命令、
+        等价筛选（含 status、金额与区块数值边界）与 bucket_size，不绑定
+        page_size。
+        """
+        self._validate_page_size(page_size)
+        self._validate_bucket_size(bucket_size)
+
+        # key = (bucket_start, method)
+        totals = {}
+        counts = {}
+        success_counts = {}
+        failure_counts = {}
+        for record in self._records:
+            if not _matches(record, filters):
+                continue
+            value = int(record["amount"])
+            bucket_start = (record["timestamp"] // bucket_size) * bucket_size
+            key = (bucket_start, record["method"])
+            totals[key] = totals.get(key, 0) + value
+            counts[key] = counts.get(key, 0) + 1
+            success_counts.setdefault(key, 0)
+            failure_counts.setdefault(key, 0)
+            if record.get("success", True):
+                success_counts[key] += 1
+            else:
+                failure_counts[key] += 1
+
+        # (bucket_start, -total, -count, -success, -failure, method)
+        # 升序即 bucket_start 升序，其后各数值降序、method 升序，
+        # 同时得到可直接 bisect 的单调递增键
+        group_keys = sorted(
+            totals,
+            key=lambda k: (
+                k[0],
+                -totals[k],
+                -counts[k],
+                -success_counts[k],
+                -failure_counts[k],
+                k[1],
+            ),
+        )
+        total_groups = len(group_keys)
+
+        start = 0
+        if cursor is not None:
+            (
+                after_bucket_start,
+                after_total,
+                after_count,
+                after_success,
+                after_failure,
+                after_method,
+            ) = decode_method_time_stats_cursor(cursor, filters, bucket_size)
+            keys = [
+                (
+                    k[0],
+                    -totals[k],
+                    -counts[k],
+                    -success_counts[k],
+                    -failure_counts[k],
+                    k[1],
+                )
+                for k in group_keys
+            ]
+            marker = (
+                after_bucket_start,
+                -after_total,
+                -after_count,
+                -after_success,
+                -after_failure,
+                after_method,
+            )
+            # keyset 续页：排序键严格大于 marker 的第一个位置。
+            # marker 位于两键之间也安全（bisect 取下一键），不会跳过或重复。
+            start = bisect.bisect_left(keys, marker)
+            if start < total_groups and keys[start] == marker:
+                # marker 命中现存分组本身：从其后一组开始
+                start += 1
+
+        end = start + page_size
+        page_keys = group_keys[start:end]
+        groups = []
+        for bucket_start, method in page_keys:
+            groups.append({
+                "bucket_start": bucket_start,
+                "method": method,
+                "total_count": counts[(bucket_start, method)],
+                "total_amount": str(totals[(bucket_start, method)]),
+                "success_count": success_counts[(bucket_start, method)],
+                "failure_count": failure_counts[(bucket_start, method)],
+            })
+        if end < total_groups:
+            last_bucket_start, last_method = page_keys[-1]
+            next_cursor = encode_method_time_stats_cursor(
+                filters,
+                bucket_size,
+                last_bucket_start,
+                totals[page_keys[-1]],
+                counts[page_keys[-1]],
+                success_counts[page_keys[-1]],
+                failure_counts[page_keys[-1]],
+                last_method,
             )
         else:
             next_cursor = None
