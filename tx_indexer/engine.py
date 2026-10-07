@@ -111,6 +111,7 @@ from .cursor import (
     encode_time_stats_cursor,
 )
 from .errors import (
+    CursorOutOfRangeError,
     InvalidAggregationFilter,
     InvalidAggregationRange,
     InvalidAmountFilterError,
@@ -523,6 +524,20 @@ class TxIndexer:
             ]
         self._records.extend(records)
 
+    def remove_records(self, records):
+        """按对象身份删除给定记录（链分叉修正回滚用）。
+
+        只删除与 ``records`` 中对象同一身份的记录，其余记录（含其他
+        来源链上 tx_hash 相同的记录）原样保留。删除后查询与全部统计
+        入口立即只观察当前有效分支；指向被删交易的分页游标在此后的
+        query 中抛 CursorOutOfRangeError，不返回旧分支数据。
+        """
+        identities = {id(record) for record in records}
+        if identities:
+            self._records = [
+                r for r in self._records if id(r) not in identities
+            ]
+
     def _matched(self, filters):
         matched = [r for r in self._records if _matches(r, filters)]
         matched.sort(key=lambda r: (r["block_number"], r["tx_hash"]))
@@ -543,7 +558,11 @@ class TxIndexer:
             )
 
     def query(self, filters, page_size=DEFAULT_PAGE_SIZE, cursor=None):
-        """分页查询。返回 {transactions, total, next_cursor}。"""
+        """分页查询。返回 {transactions, total, next_cursor}。
+
+        游标 marker 指向的交易已被链分叉修正回滚（不再存在于当前有效
+        分支）时抛 CursorOutOfRangeError，不返回旧分支数据。
+        """
         self._validate_page_size(page_size)
 
         matched = self._matched(filters)
@@ -553,12 +572,17 @@ class TxIndexer:
         if cursor is not None:
             after_block, after_tx_hash = decode_cursor(cursor, filters)
             # keyset 续页：排序键严格大于 marker 的第一个位置。
-            # marker 位于两键之间也安全（bisect 取下一键），不会跳过或重复。
             keys = [(r["block_number"], r["tx_hash"]) for r in matched]
             start = bisect.bisect_left(keys, (after_block, after_tx_hash))
             if start < total and keys[start] == (after_block, after_tx_hash):
                 # marker 命中现存记录本身：从其后一条开始
                 start += 1
+            else:
+                # marker 指向的交易已不在当前有效分支（链分叉修正把它
+                # 回滚了）：拒绝续页，不静默返回旧分支之后的数据
+                raise CursorOutOfRangeError(
+                    "分页游标指向的交易已不在当前有效分支", None
+                )
 
         end = start + page_size
         page = matched[start:end]

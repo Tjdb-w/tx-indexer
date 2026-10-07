@@ -99,6 +99,27 @@ class InvalidBucketSizeError(TxIndexerError):
     error = "invalid_bucket_size"
 
 
+class InvalidImportBatchError(TxIndexerError):
+    """分批增量导入的批次非法：来源链标识为空、区块高度为负、批次序号
+    非正数、批次内出现重复区块哈希，或交易记录不符公开字段语义。"""
+
+    error = "invalid_import_batch"
+
+
+class BlockLinkMismatchError(TxIndexerError):
+    """批次的父区块哈希与引擎当前末端区块哈希（或可接受的分叉点）
+    不一致；导入前的索引、统计与查询结果保持不变。"""
+
+    error = "block_link_mismatch"
+
+
+class CursorOutOfRangeError(TxIndexerError):
+    """分页游标指向的交易已被链分叉修正回滚，不再属于当前有效分支；
+    不返回旧分支数据。"""
+
+    error = "cursor_out_of_range"
+
+
 class SourceUnavailableError(TxIndexerError):
     """上游暂时无法返回指定区块；已提交批次与水位保持有效。"""
 
