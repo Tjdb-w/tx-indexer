@@ -32,11 +32,19 @@ tx_hash 在不同 chain_id 中属于不同交易，区块内容、查询结果�
 :class:`~tx_indexer.errors.SourceUnavailableError`：已完整提交的前序
 批次与水位保持有效，下一次原样重放未完成范围即可。
 
+每笔上游交易除基础查询字段外可选携带 ``success``：缺省视为 ``true``，
+显式提供时只能是布尔 ``true`` / ``false``（``0``、``1``、``null``、
+字符串等均非法），标准化后随记录写入现有索引，沿用与 JSON Lines 加载
+完全一致的状态口径参与状态筛选与状态聚合。
+
 幂等与冲突：相同交易哈希与相同标准化内容（区块高度、区块时间、发起
-地址、接收地址、方法标识）再次出现视为重复，不新增记录，也不改变首次
-写入结果；相同交易哈希却出现不同内容时抛
+地址、接收地址、方法标识、成功状态）再次出现视为重复，不新增记录，
+也不改变首次写入结果；显式 ``success: true`` 与缺省 ``success`` 在
+标准化后同为成功、视为相同状态。相同交易哈希却出现不同内容（含成功
+/失败状态不一致）时抛
 :class:`~tx_indexer.errors.TransactionConflictError`，停止当前批次，
-水位不推进到冲突交易所在批次。批次只在整批校验通过后提交，中途失败
+水位不推进到冲突交易所在批次。非法 ``success`` 抛 ``ValueError``，
+同样在当前批次写入之前生效。批次只在整批校验通过后提交，中途失败
 不会留下半批结果。多链入口下身份判定按链进行：跨链同哈希既不视为
 重复，也不构成冲突。
 
@@ -71,13 +79,16 @@ _NORMALIZED_FIELDS = (
     "amount",
 )
 
-#: 判定「同一交易哈希是否为同一笔交易」的标准化内容字段
+#: 判定「同一交易哈希是否为同一笔交易」的标准化内容字段。
+#: success 纳入身份：显式 true 与缺省在标准化后同为 True，等价判重；
+#: true 与 false 不一致即构成冲突。
 _IDENTITY_FIELDS = (
     "block_number",
     "timestamp",
     "from_address",
     "to_address",
     "method",
+    "success",
 )
 
 
@@ -109,6 +120,11 @@ def _normalize_transaction(raw, block_height, index):
 
     成功返回仅含固定字段的新字典（忽略未定义的额外字段）；任何结构或
     类型问题抛 ValueError。``block_number`` 必须等于其所在区块高度。
+
+    ``success`` 可选：缺省标准化为 ``True``；显式给出时只能是布尔
+    ``True`` / ``False``，数字（``0``/``1``，注意 bool 是 int 子类）、
+    字符串、``None`` 等一律拒绝。标准化结果始终携带布尔 ``success``，
+    使其与 JSON Lines 加载记录遵循同一状态口径。
     """
     if not isinstance(raw, dict):
         raise ValueError(
@@ -155,12 +171,20 @@ def _normalize_transaction(raw, block_height, index):
             "区块 %d 的 transactions[%d] amount 必须为非负十进制整数字符串"
             % (block_height, index)
         )
+    if "success" in raw and not isinstance(raw["success"], bool):
+        raise ValueError(
+            "区块 %d 的 transactions[%d] success 必须为布尔值 true 或 false"
+            % (block_height, index)
+        )
 
-    return {name: raw[name] for name in _NORMALIZED_FIELDS}
+    normalized = {name: raw[name] for name in _NORMALIZED_FIELDS}
+    normalized["success"] = raw["success"] if "success" in raw else True
+    return normalized
 
 
 def _same_identity(existing, tx):
-    """同一 tx_hash 的标准化内容（区块、时间、地址、方法）是否一致。"""
+    """同一 tx_hash 的标准化内容（区块、时间、地址、方法、成功状态）是否
+    一致。显式 true 与缺省 success 标准化后同为 True，按相同状态处理。"""
     return all(existing[name] == tx[name] for name in _IDENTITY_FIELDS)
 
 
@@ -177,6 +201,12 @@ class ReplayManager:
     暂时无法返回指定区块时抛
     :class:`~tx_indexer.errors.SourceUnavailableError`。也可以在每次
     :meth:`submit` 时通过同名参数覆盖。
+
+    交易必填 ``tx_hash``、``block_number``、``timestamp``、
+    ``from_address``、``to_address``、``method``、``amount``，另可选
+    ``success``（缺省 ``true``，显式时只能是布尔值）；标准化结果携带
+    布尔 ``success`` 写入索引，状态筛选与状态聚合按成功/失败分别计数，
+    缺省交易计入成功。
     """
 
     def __init__(self, fetch_blocks=None, indexer=None):
@@ -233,8 +263,10 @@ class ReplayManager:
         "processed_batch_count", "committed_count", "skipped_count",
         "last_batch_committed_at"}``
 
-        参数非法抛 ValueError；上游不可用抛 SourceUnavailableError；
-        同哈希内容冲突抛 TransactionConflictError。
+        参数非法（含 success 显式给出但不是布尔值）抛 ValueError；上游
+        不可用抛 SourceUnavailableError；同哈希标准化内容不一致（含
+        success 成功/失败状态不同）抛 TransactionConflictError。异常均在
+        当前批次写入之前生效，不产生部分提交。
         """
         _validate_range(start_block, end_block, batch_size)
         if not _is_nonempty_text(chain_id):
