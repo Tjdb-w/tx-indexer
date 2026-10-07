@@ -28,13 +28,18 @@ tx_hash 在不同 chain_id 中属于不同交易，区块内容、查询结果�
 
 区块数据通过可调用对象 ``fetch_blocks(start, end)`` 按需拉取，返回
 ``{block_number, transactions}`` 映射的列表（顺序不要求，按高度归位）。
-上游暂时无法返回指定区块时抛
+每笔交易除必填字段外可携带可选的 ``success``（布尔值，缺省视为
+``true``；显式给出时只能是 ``true`` 或 ``false``，0/1、null、字符串
+等非布尔值抛 ValueError），标准化后随整批写入索引，状态筛选
+（``status=success`` / ``failure``）与状态聚合（status_stats 等）
+对水位重放写入的交易同样生效。上游暂时无法返回指定区块时抛
 :class:`~tx_indexer.errors.SourceUnavailableError`：已完整提交的前序
 批次与水位保持有效，下一次原样重放未完成范围即可。
 
 幂等与冲突：相同交易哈希与相同标准化内容（区块高度、区块时间、发起
-地址、接收地址、方法标识）再次出现视为重复，不新增记录，也不改变首次
-写入结果；相同交易哈希却出现不同内容时抛
+地址、接收地址、方法标识、成功状态）再次出现视为重复，不新增记录，
+也不改变首次写入结果；相同交易哈希却出现不同内容（含同一哈希显式
+``true`` 与缺省之外的任何不同状态）时抛
 :class:`~tx_indexer.errors.TransactionConflictError`，停止当前批次，
 水位不推进到冲突交易所在批次。批次只在整批校验通过后提交，中途失败
 不会留下半批结果。多链入口下身份判定按链进行：跨链同哈希既不视为
@@ -60,7 +65,8 @@ from .loader import _AMOUNT_RE, _is_nonneg_int, _is_nonempty_text
 MIN_BATCH_SIZE = 1
 MAX_BATCH_SIZE = 1000
 
-#: 标准化后保留的交易身份与查询字段（顺序即写入索引的字段顺序）
+#: 标准化后保留的交易身份与查询字段（顺序即写入索引的字段顺序）；
+#: 可选的 success 在标准化时单独归一（缺省补 True）并追加在末尾
 _NORMALIZED_FIELDS = (
     "tx_hash",
     "block_number",
@@ -71,13 +77,15 @@ _NORMALIZED_FIELDS = (
     "amount",
 )
 
-#: 判定「同一交易哈希是否为同一笔交易」的标准化内容字段
+#: 判定「同一交易哈希是否为同一笔交易」的标准化内容字段（含状态：
+#: 显式 true 与缺省都归一为 True，视为相同状态；状态不同即冲突）
 _IDENTITY_FIELDS = (
     "block_number",
     "timestamp",
     "from_address",
     "to_address",
     "method",
+    "success",
 )
 
 
@@ -109,6 +117,8 @@ def _normalize_transaction(raw, block_height, index):
 
     成功返回仅含固定字段的新字典（忽略未定义的额外字段）；任何结构或
     类型问题抛 ValueError。``block_number`` 必须等于其所在区块高度。
+    ``success`` 可选：缺省归一为 True；显式给出时只能是布尔值
+    （0/1、null、字符串等非布尔值一律拒绝）。
     """
     if not isinstance(raw, dict):
         raise ValueError(
@@ -155,12 +165,23 @@ def _normalize_transaction(raw, block_height, index):
             "区块 %d 的 transactions[%d] amount 必须为非负十进制整数字符串"
             % (block_height, index)
         )
+    # success 可选：缺省视为 true；显式给出时只能是布尔值。
+    # bool 是 int 的子类，0/1 不会通过 isinstance(..., bool) 检查，
+    # 因此数字、字符串、null 等都在此被拒绝。
+    success = raw.get("success", True)
+    if not isinstance(success, bool):
+        raise ValueError(
+            "区块 %d 的 transactions[%d] success 必须为布尔值 true 或 false"
+            % (block_height, index)
+        )
 
-    return {name: raw[name] for name in _NORMALIZED_FIELDS}
+    normalized = {name: raw[name] for name in _NORMALIZED_FIELDS}
+    normalized["success"] = success
+    return normalized
 
 
 def _same_identity(existing, tx):
-    """同一 tx_hash 的标准化内容（区块、时间、地址、方法）是否一致。"""
+    """同一 tx_hash 的标准化内容（区块、时间、地址、方法、状态）是否一致。"""
     return all(existing[name] == tx[name] for name in _IDENTITY_FIELDS)
 
 
